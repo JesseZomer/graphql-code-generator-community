@@ -160,6 +160,30 @@ const config: CodegenConfig = {
         withMutationFn: false,
       },
     },
+    './dev-test/typescript-operation-mocks/': {
+      schema: './dev-test/typescript-operation-mocks/schema.graphql',
+      documents: './dev-test/typescript-operation-mocks/*.graphql',
+      plugins: ['typescript-operation-mocks'],
+      preset: 'near-operation-file',
+      presetConfig: {
+        extension: '.operation.mock.ts',
+        folder: '__generated__',
+        baseTypesPath: '',
+      },
+      config: {
+        generateMocks: true,
+        generateQueryTypes: true,
+      },
+    },
+    './dev-test/typescript-operation-mocks/query-types.ts': {
+      schema: './dev-test/typescript-operation-mocks/schema.graphql',
+      documents: './dev-test/typescript-operation-mocks/*.graphql',
+      plugins: ['typescript-operation-mocks'],
+      config: {
+        generateMocks: false,
+        generateQueryTypes: true,
+      },
+    },
   },
 };
 

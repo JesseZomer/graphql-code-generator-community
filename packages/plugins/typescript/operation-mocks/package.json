@@ -1,0 +1,58 @@
+{
+  "name": "@graphql-codegen/typescript-operation-mocks",
+  "version": "6.0.0",
+  "type": "module",
+  "description": "GraphQL Code Generator plugin for generating mocks based on your queries and mutations",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dotansimha/graphql-code-generator-community.git",
+    "directory": "packages/plugins/typescript/operation-mocks"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">= 16.0.0"
+  },
+  "main": "dist/cjs/index.js",
+  "module": "dist/esm/index.js",
+  "exports": {
+    ".": {
+      "require": {
+        "types": "./dist/typings/index.d.cts",
+        "default": "./dist/cjs/index.js"
+      },
+      "import": {
+        "types": "./dist/typings/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "default": {
+        "types": "./dist/typings/index.d.ts",
+        "default": "./dist/esm/index.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "typings": "dist/typings/index.d.ts",
+  "scripts": {
+    "lint": "eslint **/*.ts",
+    "test": "vitest --no-watch"
+  },
+  "peerDependencies": {
+    "graphql": "^0.12.0 || ^0.13.0 || ^14.0.0 || ^15.0.0"
+  },
+  "dependencies": {
+    "@graphql-codegen/plugin-helpers": "6.0.0",
+    "tslib": "~1.11.1",
+    "vitest": "^3.2.4"
+  },
+  "devDependencies": {
+    "@graphql-codegen/testing": "1.18.3",
+    "graphql-tag": "^2.12.6"
+  },
+  "publishConfig": {
+    "directory": "dist",
+    "access": "public"
+  },
+  "typescript": {
+    "definition": "dist/typings/index.d.ts"
+  }
+}

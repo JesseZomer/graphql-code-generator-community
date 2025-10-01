@@ -1,0 +1,40 @@
+scalar Date
+
+type Message {
+  id: String!
+  description: String!
+  author: Author
+  date: Date
+}
+
+type Author {
+  id: String!
+  name: String!
+  adress: Adress
+}
+
+type Adress {
+  street: String!
+  city: String!
+  country: String
+}
+
+type Query {
+  messages(tab: String!): [Message]
+}
+
+input CreateMessageInput {
+  description: String!
+}
+
+type Mutation {
+  createMessage(args: CreateMessageInput!): Message
+  approve(id: ID!): Message
+  decline(id: ID!, reason: String!): Message
+  escalate(id: ID!): Message
+}
+
+schema {
+  query: Query
+  mutation: Mutation
+}

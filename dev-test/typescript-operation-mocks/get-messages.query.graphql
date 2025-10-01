@@ -1,0 +1,14 @@
+query GetMessages($tab: String!) {
+  messages(tab: $tab) {
+    id
+    author {
+      name
+      adress {
+        street
+        city
+        country
+      }
+    }
+    date
+  }
+}

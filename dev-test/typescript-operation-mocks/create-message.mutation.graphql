@@ -1,0 +1,5 @@
+mutation CreateMessage($args: CreateMessageInput!) {
+  createMessage(args: $args) {
+    id
+  }
+}
