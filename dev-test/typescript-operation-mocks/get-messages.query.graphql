@@ -1,4 +1,4 @@
-query GetMessages($tab: String!) {
+query messages($tab: String!) {
   messages(tab: $tab) {
     id
     author {
@@ -10,5 +10,11 @@ query GetMessages($tab: String!) {
       }
     }
     date
+    replyTo {
+      id
+      author {
+        name
+      }
+    }
   }
 }

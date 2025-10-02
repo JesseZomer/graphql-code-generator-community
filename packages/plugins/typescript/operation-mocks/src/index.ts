@@ -9,6 +9,43 @@ import {
 import { PluginFunction, Types } from '@graphql-codegen/plugin-helpers';
 
 /**
+ * Capitalize the first letter of a string
+ */
+function capitalize(str: string): string {
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+/**
+ * Convert a context path to camelCase for function names
+ * e.g., "messages.replyTo.author" → "messages_replyTo_author"
+ */
+function contextToCamelCase(contextPath: string): string {
+  const parts = contextPath.split('.').filter(part => part !== '');
+  if (parts.length === 0) return '';
+
+  // First part lowercase, rest camelCase
+  const camelParts = parts.map((part, index) => {
+    if (index === 0) return part.toLowerCase();
+    return part.charAt(0).toLowerCase() + part.slice(1);
+  });
+
+  return camelParts.join('_');
+}
+
+/**
+ * Convert a context path to PascalCase for interface names
+ * e.g., "messages.replyTo.author" → "Messages_ReplyTo_Author"
+ */
+function contextToPascalCase(contextPath: string): string {
+  const parts = contextPath.split('.').filter(part => part !== '');
+  if (parts.length === 0) return '';
+
+  const pascalParts = parts.map(part => part.charAt(0).toUpperCase() + part.slice(1));
+
+  return '_' + pascalParts.join('_');
+}
+
+/**
  * Configuration options for the TypeScript Operation Mocks plugin
  */
 export interface OperationMocksPluginConfig {
@@ -36,9 +73,10 @@ export interface OperationMocksPluginConfig {
   typesFile?: string;
 }
 
-// Interface to track what fields are selected for each type
+// Interface to track what fields are selected for each type with context path
 interface TypeFieldSelection {
   typeName: string;
+  contextPath: string; // e.g., "Message", "Message.replyTo", "Message.replyTo.author"
   selectedFields: Set<string>;
 }
 
@@ -95,6 +133,9 @@ function generateMockFieldValue(
   fieldName: string,
   operationName: string,
   allTypeSelections: TypeFieldSelection[],
+  currentContextPath: string,
+  hasSingleRoot: boolean,
+  rootFieldName?: string,
 ): string {
   const schemaType = schema.getType(typeName);
 
@@ -111,17 +152,33 @@ function generateMockFieldValue(
   const baseType = getBaseType(fieldDef.type);
   const referencedTypeName = baseType.name;
 
+  // Build the context path for this field
+  const fieldContextPath = currentContextPath ? `${currentContextPath}.${fieldName}` : fieldName;
+
   // Check if this field references another object type that we have a mock for
-  const hasReferencedMockFunction = allTypeSelections.some(
-    selection => selection.typeName === referencedTypeName,
+  const referencedTypeSelection = allTypeSelections.find(
+    selection =>
+      selection.typeName === referencedTypeName && selection.contextPath === fieldContextPath,
   );
 
-  if (hasReferencedMockFunction && isObjectType(baseType)) {
-    // Call the mock function for the referenced type
-    return `    ${fieldName}: fake${operationName}${referencedTypeName}()`;
-  }
+  if (referencedTypeSelection && isObjectType(baseType)) {
+    // Adjust context path for single root field operations
+    let adjustedContextPath = referencedTypeSelection.contextPath;
+    if (hasSingleRoot && rootFieldName && adjustedContextPath.startsWith(rootFieldName)) {
+      adjustedContextPath =
+        adjustedContextPath === rootFieldName
+          ? ''
+          : adjustedContextPath.substring(rootFieldName.length + 1);
+    }
 
-  // Generate appropriate primitive mock values
+    // Create the mock function name for the referenced type using new naming pattern
+    const contextSuffix = contextToCamelCase(adjustedContextPath);
+    const referencedFunctionName = contextSuffix
+      ? `fake_${operationName.toLowerCase()}_${contextSuffix}`
+      : `fake_${operationName.toLowerCase()}`;
+
+    return `    ${fieldName}: ${referencedFunctionName}()`;
+  } // Generate appropriate primitive mock values
   const mockValue = getPrimitiveMockValue(baseType.name, fieldName);
   return `    ${fieldName}: ${mockValue}`;
 }
@@ -169,7 +226,7 @@ function generateOperationMocks(
 
   // Import generated query-specific types when enabled
   if (useGeneratedTypes) {
-    mockFunctions.push(`import type * as QueryTypes from '../query-types';`, '');
+    mockFunctions.push(`import type * as QueryTypes from './_query-types';`, '');
   }
 
   documents
@@ -183,16 +240,35 @@ function generateOperationMocks(
             def.kind === Kind.OPERATION_DEFINITION && !!def.name?.value,
         )
         .forEach(operation => {
-          const operationName = operation.name!.value;
+          const operationName = capitalize(operation.name!.value);
           const typeSelections = findTypeSelections(schema, operation);
+
+          // Check if operation has only one root field to adjust context paths
+          const { isSingle: hasSingleRoot, rootFieldName } = hasSingleRootField(operation);
 
           // Create a mock function for each type and its selected fields
           typeSelections.forEach(typeSelection => {
-            const functionName = `fake${operationName}${typeSelection.typeName}`;
+            // Adjust context path for single root field operations
+            let adjustedContextPath = typeSelection.contextPath;
+            if (hasSingleRoot && rootFieldName && adjustedContextPath.startsWith(rootFieldName)) {
+              // Remove the root field from the context path for single root operations
+              adjustedContextPath =
+                adjustedContextPath === rootFieldName
+                  ? ''
+                  : adjustedContextPath.substring(rootFieldName.length + 1);
+            }
+
+            // Create function name: fake_${queryname}_${contexts}
+            const contextSuffix = contextToCamelCase(adjustedContextPath);
+            const functionName = contextSuffix
+              ? `fake_${operationName.toLowerCase()}_${contextSuffix}`
+              : `fake_${operationName.toLowerCase()}`;
 
             // Use generated interface name if useGeneratedTypes is true
+            const operationType = operation.operation;
+            const basePrefix = operationType.charAt(0).toUpperCase() + operationType.slice(1);
             const interfaceName = useGeneratedTypes
-              ? `QueryTypes.${operationName}_${typeSelection.typeName}`
+              ? `QueryTypes.${basePrefix}_${operationName}${contextToPascalCase(adjustedContextPath)}`
               : typeSelection.typeName;
 
             // Generate mock data for each selected field with appropriate types
@@ -204,6 +280,9 @@ function generateOperationMocks(
                   field,
                   operationName,
                   typeSelections,
+                  typeSelection.contextPath,
+                  hasSingleRoot,
+                  rootFieldName,
                 ),
               )
               .join(',\n');
@@ -257,11 +336,29 @@ function generateQueryTypes_impl(schema: GraphQLSchema, documents: Types.Documen
             def.kind === Kind.OPERATION_DEFINITION && !!def.name?.value,
         )
         .forEach(operation => {
-          const operationName = operation.name!.value;
+          const operationName = capitalize(operation.name!.value);
           const typeSelections = findTypeSelections(schema, operation);
 
+          // Check if operation has only one root field to adjust context paths
+          const { isSingle: hasSingleRoot, rootFieldName } = hasSingleRootField(operation);
+
           typeSelections.forEach(typeSelection => {
-            const interfaceName = `${operationName}_${typeSelection.typeName}`;
+            // Adjust context path for single root field operations
+            let adjustedContextPath = typeSelection.contextPath;
+            if (hasSingleRoot && rootFieldName && adjustedContextPath.startsWith(rootFieldName)) {
+              // Remove the root field from the context path for single root operations
+              adjustedContextPath =
+                adjustedContextPath === rootFieldName
+                  ? ''
+                  : adjustedContextPath.substring(rootFieldName.length + 1);
+            }
+
+            // Create interface name: ${base}_${queryname}_${context}
+            const operationType = operation.operation; // 'query', 'mutation', 'subscription'
+            const basePrefix = operationType.charAt(0).toUpperCase() + operationType.slice(1); // 'Query', 'Mutation', 'Subscription'
+
+            const interfaceName = `${basePrefix}_${operationName}${contextToPascalCase(adjustedContextPath)}`;
+
             allTypeSelections.set(interfaceName, typeSelection.selectedFields);
           });
         });
@@ -279,12 +376,29 @@ function generateQueryTypes_impl(schema: GraphQLSchema, documents: Types.Documen
             def.kind === Kind.OPERATION_DEFINITION && !!def.name?.value,
         )
         .forEach(operation => {
-          const operationName = operation.name!.value;
+          const operationName = capitalize(operation.name!.value);
           const typeSelections = findTypeSelections(schema, operation);
+
+          // Check if operation has only one root field to adjust context paths
+          const { isSingle: hasSingleRoot, rootFieldName } = hasSingleRootField(operation);
 
           // Create TypeScript interfaces for each type with selected fields
           typeSelections.forEach(typeSelection => {
-            const interfaceName = `${operationName}_${typeSelection.typeName}`;
+            // Adjust context path for single root field operations
+            let adjustedContextPath = typeSelection.contextPath;
+            if (hasSingleRoot && rootFieldName && adjustedContextPath.startsWith(rootFieldName)) {
+              // Remove the root field from the context path for single root operations
+              adjustedContextPath =
+                adjustedContextPath === rootFieldName
+                  ? ''
+                  : adjustedContextPath.substring(rootFieldName.length + 1);
+            }
+
+            // Create interface name: ${base}_${queryname}_${context}
+            const operationType = operation.operation; // 'query', 'mutation', 'subscription'
+            const basePrefix = operationType.charAt(0).toUpperCase() + operationType.slice(1); // 'Query', 'Mutation', 'Subscription'
+
+            const interfaceName = `${basePrefix}_${operationName}${contextToPascalCase(adjustedContextPath)}`;
 
             if (!generatedTypes.has(interfaceName)) {
               generatedTypes.add(interfaceName);
@@ -309,7 +423,26 @@ function generateQueryTypes_impl(schema: GraphQLSchema, documents: Types.Documen
                       else if (baseType.name === 'ID') fieldType = 'string';
                       else {
                         // Check if this is an object type that we're generating an interface for
-                        const referencedInterfaceName = `${operationName}_${baseType.name}`;
+                        // Build the referenced interface name with proper context
+                        const fieldContextPath = typeSelection.contextPath
+                          ? `${typeSelection.contextPath}.${field}`
+                          : field;
+
+                        // Adjust context path for single root field operations
+                        let adjustedFieldContextPath = fieldContextPath;
+                        if (
+                          hasSingleRoot &&
+                          rootFieldName &&
+                          adjustedFieldContextPath.startsWith(rootFieldName)
+                        ) {
+                          adjustedFieldContextPath =
+                            adjustedFieldContextPath === rootFieldName
+                              ? ''
+                              : adjustedFieldContextPath.substring(rootFieldName.length + 1);
+                        }
+
+                        const referencedInterfaceName = `${basePrefix}_${operationName}${contextToPascalCase(adjustedFieldContextPath)}`;
+
                         if (allTypeSelections.has(referencedInterfaceName)) {
                           fieldType = referencedInterfaceName;
                         } else {
@@ -343,6 +476,25 @@ ${interfaceFields}
 }
 
 /**
+ * Check if an operation has only one root field selection
+ */
+function hasSingleRootField(operation: OperationDefinitionNode): {
+  isSingle: boolean;
+  rootFieldName?: string;
+} {
+  const rootSelections = operation.selectionSet.selections.filter(
+    selection => selection.kind === Kind.FIELD,
+  );
+
+  if (rootSelections.length === 1) {
+    const rootField = rootSelections[0] as FieldNode;
+    return { isSingle: true, rootFieldName: rootField.name.value };
+  }
+
+  return { isSingle: false };
+}
+
+/**
  * Analyzes a GraphQL operation to find all selected types and their fields.
  *
  * WHAT IT DOES:
@@ -361,7 +513,7 @@ function findTypeSelections(
   schema: GraphQLSchema,
   operation: OperationDefinitionNode,
 ): TypeFieldSelection[] {
-  const typeSelections = new Map<string, Set<string>>();
+  const typeSelections = new Map<string, TypeFieldSelection>(); // Map by contextPath
 
   // Determine the root type based on operation kind
   const rootType = {
@@ -372,14 +524,16 @@ function findTypeSelections(
 
   if (rootType) {
     // Process the operation using iterative traversal (more efficient than recursion)
-    collectTypeSelectionsIteratively(operation.selectionSet.selections, typeSelections, rootType);
+    collectTypeSelectionsIteratively(
+      operation.selectionSet.selections,
+      typeSelections,
+      rootType,
+      '',
+    );
   }
 
   // Convert Map to TypeFieldSelection array
-  return Array.from(typeSelections.entries()).map(([typeName, selectedFields]) => ({
-    typeName,
-    selectedFields,
-  }));
+  return Array.from(typeSelections.values());
 }
 
 /**
@@ -398,16 +552,23 @@ function findTypeSelections(
  */
 function collectTypeSelectionsIteratively(
   initialSelections: readonly any[],
-  typeSelections: Map<string, Set<string>>,
+  typeSelections: Map<string, TypeFieldSelection>,
   initialParentType: any,
+  initialContextPath: string = '',
 ) {
-  // Queue of selections to process: [{ selections, parentType }]
-  let processingQueue = [{ selections: initialSelections, parentType: initialParentType }];
+  // Queue of selections to process: [{ selections, parentType, contextPath }]
+  let processingQueue = [
+    {
+      selections: initialSelections,
+      parentType: initialParentType,
+      contextPath: initialContextPath,
+    },
+  ];
 
   // Process queue until empty (breadth-first traversal)
   while (processingQueue.length > 0) {
     // Process current level and build next level queue
-    processingQueue = processingQueue.flatMap(({ selections, parentType }) =>
+    processingQueue = processingQueue.flatMap(({ selections, parentType, contextPath }) =>
       selections
         .filter(selection => selection.kind === Kind.FIELD) // Only process field selections
         .map(selection => selection as FieldNode)
@@ -419,24 +580,38 @@ function collectTypeSelectionsIteratively(
           // Track object types and their selected fields
           if (isObjectType(fieldType)) {
             const typeName = fieldType.name;
+            const newContextPath = contextPath
+              ? `${contextPath}.${field.name.value}`
+              : field.name.value;
+            const contextKey = `${typeName}@${newContextPath}`;
 
-            // Initialize field set for this type
-            if (!typeSelections.has(typeName)) {
-              typeSelections.set(typeName, new Set());
+            // Initialize type selection for this context
+            if (!typeSelections.has(contextKey)) {
+              typeSelections.set(contextKey, {
+                typeName,
+                contextPath: newContextPath,
+                selectedFields: new Set(),
+              });
             }
 
             // Process nested selections if they exist
             if (field.selectionSet) {
-              // Record all selected fields for this type
+              // Record all selected fields for this type in this context
               field.selectionSet.selections
                 .filter(nestedSelection => nestedSelection.kind === Kind.FIELD)
                 .forEach(nestedSelection => {
                   const nestedField = nestedSelection as FieldNode;
-                  typeSelections.get(typeName)!.add(nestedField.name.value);
+                  typeSelections.get(contextKey)!.selectedFields.add(nestedField.name.value);
                 });
 
               // Queue nested selections for next iteration
-              return [{ selections: field.selectionSet.selections, parentType: fieldType }];
+              return [
+                {
+                  selections: field.selectionSet.selections,
+                  parentType: fieldType,
+                  contextPath: newContextPath,
+                },
+              ];
             }
           }
 

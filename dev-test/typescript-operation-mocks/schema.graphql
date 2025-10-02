@@ -5,6 +5,7 @@ type Message {
   description: String!
   author: Author
   date: Date
+  replyTo: Message
 }
 
 type Author {

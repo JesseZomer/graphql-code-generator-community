@@ -49,7 +49,7 @@ describe('TypeScript Operation Mocks Plugin', () => {
     });
 
     expect(result).toContain("import * as Types from '../types';");
-    expect(result).toContain('export const fakeGetMessagesMessage');
+    expect(result).toContain('export const fake_getmessages');
     expect(result).toContain('(overrides?: Partial<Message>): Message');
     expect(result).toContain("id: 'id'");
   });
@@ -73,7 +73,7 @@ describe('TypeScript Operation Mocks Plugin', () => {
       typesFile: '../types',
     });
 
-    expect(result).toContain('export const fakeCreateMessageMessage');
+    expect(result).toContain('export const fake_createmessage');
     expect(result).toContain('(overrides?: Partial<Message>): Message');
   });
 
@@ -107,9 +107,52 @@ describe('TypeScript Operation Mocks Plugin', () => {
       typesFile: '../types',
     });
 
-    expect(result).toContain('fakeGetMessagesMessage');
-    expect(result).toContain('fakeApproveMessage');
-    expect(result).toContain('fakeDeclineMessage');
+    expect(result).toContain('fake_getmessages');
+    expect(result).toContain('fake_approve');
+    expect(result).toContain('fake_decline');
+  });
+
+  it('Should handle multiple root fields by keeping the root field name', async () => {
+    const multiFieldSchema = buildSchema(/* GraphQL */ `
+      type Message {
+        id: String!
+        description: String!
+      }
+
+      type User {
+        id: String!
+        name: String!
+      }
+
+      type Query {
+        messages(tab: String!): [Message]
+        users: [User]
+      }
+    `);
+
+    const documents = [
+      {
+        document: parse(/* GraphQL */ `
+          query GetData($tab: String!) {
+            messages(tab: $tab) {
+              id
+            }
+            users {
+              name
+            }
+          }
+        `),
+      },
+    ];
+
+    const result = await plugin(multiFieldSchema, documents, {
+      generateMocks: true,
+      typesFile: '../types',
+    });
+
+    // For multiple root fields, should keep the root field names
+    expect(result).toContain('fake_getdata_messages');
+    expect(result).toContain('fake_getdata_users');
   });
 
   it('Should handle operations without names gracefully', async () => {
@@ -154,7 +197,7 @@ describe('TypeScript Operation Mocks Plugin', () => {
       generateMocks: false,
     });
 
-    expect(result).toContain('export interface GetMessages_Message {');
+    expect(result).toContain('export interface Query_GetMessages {');
     expect(result).toContain('  id: string;');
     expect(result).toContain('  description: string;');
     expect(result).toContain('}');
@@ -199,10 +242,10 @@ describe('TypeScript Operation Mocks Plugin', () => {
       generateMocks: false,
     });
 
-    expect(result).toContain('export interface GetMessages_Message {');
-    expect(result).toContain('export interface GetMessages_Author {');
+    expect(result).toContain('export interface Query_GetMessages {');
+    expect(result).toContain('export interface Query_GetMessages_Author {');
     expect(result).toContain('  name: string;');
     expect(result).not.toContain('  email: string;'); // email not selected
-    expect(result).toContain('  author: GetMessages_Author;'); // should reference generated interface, not schema type
+    expect(result).toContain('  author: Query_GetMessages_Author;'); // should reference generated interface, not schema type
   });
 });

@@ -166,16 +166,16 @@ const config: CodegenConfig = {
       plugins: ['typescript-operation-mocks'],
       preset: 'near-operation-file',
       presetConfig: {
-        extension: '.operation.mock.ts',
+        extension: '.mock.ts',
         folder: '__generated__',
-        baseTypesPath: '',
+        baseTypesPath: '_base-types.ts',
       },
       config: {
         generateMocks: true,
         generateQueryTypes: true,
       },
     },
-    './dev-test/typescript-operation-mocks/query-types.ts': {
+    './dev-test/typescript-operation-mocks/__generated__/_query-types.ts': {
       schema: './dev-test/typescript-operation-mocks/schema.graphql',
       documents: './dev-test/typescript-operation-mocks/*.graphql',
       plugins: ['typescript-operation-mocks'],
