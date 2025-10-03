@@ -9,20 +9,21 @@ export const fake_CreateMessage = (
   };
 };
 export const fake_Messages = (
-  overrides?: Partial<QueryTypes.Query_Messages>,
-): QueryTypes.Query_Messages => {
-  return {
+  overrides?: Partial<QueryTypes.Query_Messages>[],
+  length: number = 2,
+): QueryTypes.Query_Messages[] => {
+  return Array.from({ length }, (_, i) => ({
     __typename: 'Message',
     id: 'id',
     type: 'COMMENT',
     active: true,
     numberOfComments: 1,
     cost: 1,
-    authors: fake_Messages_authors(),
+    authors: [fake_Messages_authors()],
     date: new Date(),
     replyTo: fake_Messages_replyto(),
-    ...overrides,
-  };
+    ...(overrides?.[i] || {}),
+  }));
 };
 export const fake_Messages_authors = (
   overrides?: Partial<QueryTypes.Query_Messages_Authors>,
@@ -40,7 +41,7 @@ export const fake_Messages_replyto = (
   return {
     id: 'id',
     type: 'COMMENT',
-    authors: fake_Messages_replyto_authors(),
+    authors: [fake_Messages_replyto_authors()],
     ...overrides,
   };
 };

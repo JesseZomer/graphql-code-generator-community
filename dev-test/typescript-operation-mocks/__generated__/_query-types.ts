@@ -26,7 +26,7 @@ export interface Query_Messages {
   active: boolean | null;
   numberOfComments: number | null;
   cost: number | null;
-  authors: Query_Messages_Authors;
+  authors: Query_Messages_Authors[];
   date: Scalars['LocalDate']['output'] | null;
   replyTo: Query_Messages_ReplyTo | null;
 }
@@ -40,7 +40,7 @@ export interface Query_Messages_Authors {
 export interface Query_Messages_ReplyTo {
   id: string;
   type: TYPE;
-  authors: Query_Messages_ReplyTo_Authors;
+  authors: Query_Messages_ReplyTo_Authors[];
 }
 
 export interface Query_Messages_ReplyTo_Authors {

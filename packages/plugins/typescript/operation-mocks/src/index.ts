@@ -4,6 +4,7 @@ import {
   FragmentSpreadNode,
   GraphQLSchema,
   isEnumType,
+  isListType,
   isNonNullType,
   isObjectType,
   Kind,
@@ -29,6 +30,15 @@ import {
   getPrimitiveMockValue,
   getScalarMockValue,
 } from './utils.js';
+
+/**
+ * Check if a GraphQL type is a list type (unwrapping NonNull if needed)
+ */
+function isFieldListType(type: any): boolean {
+  // Unwrap NonNull first: String! → String, [String!]! → [String!]
+  const unwrappedType = isNonNullType(type) ? type.ofType : type;
+  return isListType(unwrappedType);
+}
 
 /**
  * Represents a loaded fragment definition
@@ -337,6 +347,11 @@ function generateMockFieldValue(
       ? `fake_${operationName}_${contextSuffix}`
       : `fake_${operationName}`;
 
+    // Check if this field is a list type and wrap with array if needed
+    if (isFieldListType(fieldDef.type)) {
+      return `    ${fieldName}: [${referencedFunctionName}()]`;
+    }
+
     return `    ${fieldName}: ${referencedFunctionName}()`;
   }
 
@@ -442,6 +457,19 @@ function generateOperationMocks(
               ? `QueryTypes.${basePrefix}_${operationName}${contextToPascalCase(adjustedContextPath)}`
               : typeSelection.typeName;
 
+            // Check if this is a root field that returns an array
+            let isRootArrayField = false;
+            if (hasSingleRoot && rootFieldName && adjustedContextPath === '') {
+              // This is the root field, check if it's a list type in the schema
+              const operationRootType = schema.getRootType(operation.operation);
+              if (operationRootType) {
+                const rootField = operationRootType.getFields()[rootFieldName];
+                if (rootField && isFieldListType(rootField.type)) {
+                  isRootArrayField = true;
+                }
+              }
+            }
+
             // Generate mock data for each selected field with appropriate types
             const mockFields = Array.from(typeSelection.selectedFields)
               .map(field =>
@@ -461,12 +489,25 @@ function generateOperationMocks(
               .filter(field => field.trim().length > 0) // Remove empty fields
               .join(',\n');
 
-            const mockFunction = `export const ${functionName} = (overrides?: Partial<${interfaceName}>): ${interfaceName} => {
+            // Generate appropriate mock function based on whether it's an array field
+            let mockFunction: string;
+            if (isRootArrayField) {
+              // Generate a function that returns an array of objects
+              mockFunction = `export const ${functionName} = (overrides?: Partial<${interfaceName}>[], length: number = 2): ${interfaceName}[] => {
+  return Array.from({ length }, (_, i) => ({
+${mockFields ? mockFields + ',' : ''}
+    ...(overrides?.[i] || {}),
+  }));
+};`;
+            } else {
+              // Generate a function that returns a single object
+              mockFunction = `export const ${functionName} = (overrides?: Partial<${interfaceName}>): ${interfaceName} => {
   return {
 ${mockFields ? mockFields + ',' : ''}
     ...overrides,
   };
 };`;
+            }
 
             mockFunctions.push(mockFunction);
           });
@@ -667,6 +708,12 @@ function generateQueryTypes_impl(
                         } else {
                           fieldType = baseType.name; // Use the schema type name as fallback
                         }
+                      }
+
+                      // Handle list types (arrays)
+                      const isListField = isFieldListType(fieldDef.type);
+                      if (isListField) {
+                        fieldType = `${fieldType}[]`;
                       }
 
                       // Add null union type for nullable fields
