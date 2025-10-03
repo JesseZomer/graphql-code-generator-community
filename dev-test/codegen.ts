@@ -160,21 +160,6 @@ const config: CodegenConfig = {
         withMutationFn: false,
       },
     },
-    './dev-test/typescript-operation-mocks/': {
-      schema: './dev-test/typescript-operation-mocks/schema.graphql',
-      documents: './dev-test/typescript-operation-mocks/*.graphql',
-      plugins: ['typescript-operation-mocks'],
-      preset: 'near-operation-file',
-      presetConfig: {
-        extension: '.mock.ts',
-        folder: '__generated__',
-        baseTypesPath: '_base-types.ts',
-      },
-      config: {
-        generateMocks: true,
-        generateQueryTypes: true,
-      },
-    },
     './dev-test/typescript-operation-mocks/__generated__/_query-types.ts': {
       schema: './dev-test/typescript-operation-mocks/schema.graphql',
       documents: './dev-test/typescript-operation-mocks/*.graphql',
@@ -182,6 +167,26 @@ const config: CodegenConfig = {
       config: {
         generateMocks: false,
         generateQueryTypes: true,
+        enumsAsConst: true,
+        scalars: {
+          LocalDate: 'Date',
+          TimezoneDate: 'Date',
+        },
+      },
+    },
+    './dev-test/typescript-operation-mocks/__generated__/_mocks.ts': {
+      schema: './dev-test/typescript-operation-mocks/schema.graphql',
+      documents: './dev-test/typescript-operation-mocks/*.graphql',
+      plugins: ['typescript-operation-mocks'],
+      config: {
+        generateMocks: true,
+        generateQueryTypes: true,
+        queryTypesFile: './_query-types.ts',
+        enumsAsConst: true,
+        scalars: {
+          LocalDate: 'Date',
+          TimezoneDate: 'Date',
+        },
       },
     },
   },

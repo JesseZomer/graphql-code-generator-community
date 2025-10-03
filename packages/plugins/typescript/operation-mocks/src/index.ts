@@ -1,48 +1,42 @@
 import {
   FieldNode,
+  FragmentDefinitionNode,
+  FragmentSpreadNode,
   GraphQLSchema,
+  isEnumType,
   isNonNullType,
   isObjectType,
   Kind,
   OperationDefinitionNode,
 } from 'graphql';
 import { PluginFunction, Types } from '@graphql-codegen/plugin-helpers';
+import {
+  buildScalarsFromConfig,
+  DeclarationBlock,
+  DEFAULT_SCALARS,
+  indent,
+  ParsedEnumValuesMap,
+  ParsedScalarsMap,
+  parseEnumValues,
+  transformComment,
+  wrapWithSingleQuotes,
+} from '@graphql-codegen/visitor-plugin-common';
+import {
+  capitalize,
+  contextToCamelCase,
+  contextToPascalCase,
+  getBaseType,
+  getPrimitiveMockValue,
+  getScalarMockValue,
+} from './utils.js';
 
 /**
- * Capitalize the first letter of a string
+ * Represents a loaded fragment definition
  */
-function capitalize(str: string): string {
-  return str.charAt(0).toUpperCase() + str.slice(1);
-}
-
-/**
- * Convert a context path to camelCase for function names
- * e.g., "messages.replyTo.author" → "messages_replyTo_author"
- */
-function contextToCamelCase(contextPath: string): string {
-  const parts = contextPath.split('.').filter(part => part !== '');
-  if (parts.length === 0) return '';
-
-  // First part lowercase, rest camelCase
-  const camelParts = parts.map((part, index) => {
-    if (index === 0) return part.toLowerCase();
-    return part.charAt(0).toLowerCase() + part.slice(1);
-  });
-
-  return camelParts.join('_');
-}
-
-/**
- * Convert a context path to PascalCase for interface names
- * e.g., "messages.replyTo.author" → "Messages_ReplyTo_Author"
- */
-function contextToPascalCase(contextPath: string): string {
-  const parts = contextPath.split('.').filter(part => part !== '');
-  if (parts.length === 0) return '';
-
-  const pascalParts = parts.map(part => part.charAt(0).toUpperCase() + part.slice(1));
-
-  return '_' + pascalParts.join('_');
+interface LoadedFragment {
+  name: string;
+  onType: string;
+  node: FragmentDefinitionNode;
 }
 
 /**
@@ -67,10 +61,34 @@ export interface OperationMocksPluginConfig {
   generateQueryTypes?: boolean;
 
   /**
-   * @description Path to import schema types from. Auto-handled by near-operation-file preset.
+   * @description Path to import schema types from.
    * @default '../types'
    */
   typesFile?: string;
+
+  /**
+   * @description Path to import generated query-specific types from when generateQueryTypes is enabled.
+   * @default './_query-types'
+   */
+  queryTypesFile?: string;
+
+  /**
+   * @description Allows you to override the default scalar mappings.
+   * @default { Date: 'Date' }
+   */
+  scalars?: any;
+
+  /**
+   * @description Allows you to override enum values mapping.
+   */
+  enumValues?: any;
+
+  /**
+   * @description Generates enum as TypeScript `const assertions` instead of `enum`.
+   * This generates `export const TYPE = { COMMENT: 'COMMENT' } as const` instead of regular enums.
+   * @default false
+   */
+  enumsAsConst?: boolean;
 }
 
 // Interface to track what fields are selected for each type with context path
@@ -103,30 +121,162 @@ export const plugin: PluginFunction<OperationMocksPluginConfig> = (
   const shouldGenerateMocks = config.generateMocks !== false; // default: true
   const shouldGenerateTypes = config.generateQueryTypes === true; // default: false
 
+  // Build scalars and enums configuration
+  let scalarsMap: ParsedScalarsMap = {};
+  let enumValuesMap: ParsedEnumValuesMap = {};
+
+  scalarsMap = buildScalarsFromConfig(schema, config, DEFAULT_SCALARS);
+  enumValuesMap = parseEnumValues({
+    schema,
+    mapOrStr: config.enumValues || {},
+  });
+
+  // Collect all fragment definitions from all documents
+  const allFragments: LoadedFragment[] = documents
+    .filter(doc => doc.document)
+    .flatMap(
+      doc =>
+        doc.document!.definitions.filter(
+          d => d.kind === Kind.FRAGMENT_DEFINITION,
+        ) as FragmentDefinitionNode[],
+    )
+    .map(fragmentDef => ({
+      name: fragmentDef.name.value,
+      onType: fragmentDef.typeCondition.name.value,
+      node: fragmentDef,
+    }));
+
   // Generate only TypeScript interfaces when mocks are disabled
   if (shouldGenerateTypes && !shouldGenerateMocks) {
-    return generateQueryTypes_impl(schema, documents);
+    return generateQueryTypes_impl(
+      schema,
+      documents,
+      allFragments,
+      scalarsMap,
+      enumValuesMap,
+      config.enumsAsConst,
+    );
   }
 
   // Generate mock functions (with optional generated type usage)
-  return generateOperationMocks(schema, documents, config.typesFile, shouldGenerateTypes);
-}; /**
- * Unwraps GraphQL type wrappers (NonNull, List) to get the base type.
- *
- * EXAMPLE: String! → String, [User!]! → User
+  return generateOperationMocks(
+    schema,
+    documents,
+    config.typesFile,
+    shouldGenerateTypes,
+    allFragments,
+    config.queryTypesFile,
+    scalarsMap,
+    enumValuesMap,
+    config.enumsAsConst,
+  );
+};
+
+/**
+ * Generate enum definitions for GraphQL enums in the schema
  */
-function getBaseType(type: any): any {
-  return type.ofType ? getBaseType(type.ofType) : type;
+function generateEnumDefinitions(
+  schema: GraphQLSchema,
+  enumValuesMap: ParsedEnumValuesMap,
+  enumsAsConst = false,
+): string {
+  const typeMap = schema.getTypeMap();
+  const enumDefinitions: string[] = [];
+
+  Object.values(typeMap).forEach(type => {
+    if (isEnumType(type) && !type.name.startsWith('__')) {
+      const enumName = type.name;
+
+      // Skip if external enum mapping is provided
+      if (enumValuesMap[enumName]?.sourceFile) {
+        return;
+      }
+
+      const enumValues = type
+        .getValues()
+        .map(value => {
+          const configValue = enumValuesMap[enumName]?.mappedValues?.[value.name];
+          const enumValue = configValue !== undefined ? configValue : value.name;
+          const comment = value.description ? transformComment(value.description, 1) : '';
+
+          if (enumsAsConst) {
+            // For const enums: KEY: 'VALUE'
+            return comment + indent(`${value.name}: ${wrapWithSingleQuotes(enumValue)}`);
+          } else {
+            // For regular enums: KEY = 'VALUE'
+            return comment + indent(`${value.name} = ${wrapWithSingleQuotes(enumValue)}`);
+          }
+        })
+        .join(',\n');
+
+      if (enumsAsConst) {
+        // Generate const enum: export const TYPE = { ... } as const; export type TYPE = typeof TYPE[keyof typeof TYPE];
+        const constDeclaration = new DeclarationBlock({
+          blockTransformer: block => block + ' as const',
+        })
+          .export()
+          .asKind('const')
+          .withName(enumName)
+          .withComment(type.description || undefined)
+          .withBlock(enumValues).string;
+
+        const typeDeclaration = `export type ${enumName} = typeof ${enumName}[keyof typeof ${enumName}];`;
+
+        enumDefinitions.push([constDeclaration, typeDeclaration].join('\n'));
+      } else {
+        // Generate regular enum
+        const enumDefinition = new DeclarationBlock({})
+          .export()
+          .asKind('enum')
+          .withName(enumName)
+          .withComment(type.description || undefined)
+          .withBlock(enumValues).string;
+
+        enumDefinitions.push(enumDefinition);
+      }
+    }
+  });
+
+  return enumDefinitions.join('\n\n');
 }
 
 /**
- * Generates a mock value for a specific field based on its GraphQL type.
- *
- * LOGIC:
- * - If field is an object type with a mock function → call that function
- * - If field is a primitive type → return appropriate mock value
- * - Fallback to string for unknown types
+ * Generate scalar definitions similar to the main TypeScript plugin
  */
+function generateScalarDefinitions(scalarsMap: ParsedScalarsMap): string {
+  const allScalars = Object.keys(scalarsMap)
+    .map(scalarName => {
+      const scalarConfig = scalarsMap[scalarName];
+      if (!scalarConfig) {
+        console.warn(`Scalar ${scalarName} is missing configuration, skipping`);
+        return null;
+      }
+
+      // ParsedScalarsMap contains ParsedMapper objects with input/output structure
+      const scalarType = (scalarConfig as any).output?.type || scalarConfig.type || 'any';
+
+      return indent(`${scalarName}: { input: ${scalarType}; output: ${scalarType}; }`);
+    })
+    .filter(Boolean);
+
+  if (allScalars.length === 0) {
+    return '';
+  }
+
+  return new DeclarationBlock({})
+    .export()
+    .asKind('type')
+    .withName('Scalars')
+    .withComment('All built-in and custom scalars, mapped to their actual values')
+    .withBlock(allScalars.join('\n')).string;
+}
+
+// Interface to track what fields are selected for each type with context path
+interface TypeFieldSelection {
+  typeName: string;
+  contextPath: string; // e.g., "Message", "Message.replyTo", "Message.replyTo.author"
+  selectedFields: Set<string>;
+}
 function generateMockFieldValue(
   schema: GraphQLSchema,
   typeName: string,
@@ -136,6 +286,8 @@ function generateMockFieldValue(
   currentContextPath: string,
   hasSingleRoot: boolean,
   rootFieldName?: string,
+  scalarsMap?: ParsedScalarsMap,
+  enumValuesMap?: ParsedEnumValuesMap,
 ): string {
   const schemaType = schema.getType(typeName);
 
@@ -145,12 +297,20 @@ function generateMockFieldValue(
   }
 
   const fieldDef = schemaType.getFields()[fieldName];
+
+  // Handle special __typename field
+  if (fieldName === '__typename') {
+    return `    ${fieldName}: '${typeName}'`;
+  }
+
   if (!fieldDef) {
     return `    ${fieldName}: '${fieldName}'`; // fallback
   }
 
   const baseType = getBaseType(fieldDef.type);
   const referencedTypeName = baseType.name;
+
+  // Build the context path for this field
 
   // Build the context path for this field
   const fieldContextPath = currentContextPath ? `${currentContextPath}.${fieldName}` : fieldName;
@@ -174,32 +334,35 @@ function generateMockFieldValue(
     // Create the mock function name for the referenced type using new naming pattern
     const contextSuffix = contextToCamelCase(adjustedContextPath);
     const referencedFunctionName = contextSuffix
-      ? `fake_${operationName.toLowerCase()}_${contextSuffix}`
-      : `fake_${operationName.toLowerCase()}`;
+      ? `fake_${operationName}_${contextSuffix}`
+      : `fake_${operationName}`;
 
     return `    ${fieldName}: ${referencedFunctionName}()`;
-  } // Generate appropriate primitive mock values
+  }
+
+  // Check if this is an enum type
+  if (isEnumType(baseType)) {
+    // Get the first enum value as a default
+    const enumValues = baseType.getValues();
+    if (enumValues.length > 0) {
+      const firstValue = enumValues[0].value;
+      // Always use string literal for enum values to maintain type-only imports
+      return `    ${fieldName}: '${firstValue}'`;
+    }
+  }
+
+  // Handle scalar types (both built-in and custom)
+  // First check for custom scalars
+  if (scalarsMap && scalarsMap[baseType.name]) {
+    const scalarConfig = scalarsMap[baseType.name];
+    const scalarType = (scalarConfig as any).output?.type || scalarConfig.type || 'any';
+    const customMockValue = getScalarMockValue(scalarType, fieldName);
+    return `    ${fieldName}: ${customMockValue}`;
+  }
+
+  // Then handle built-in GraphQL scalars
   const mockValue = getPrimitiveMockValue(baseType.name, fieldName);
   return `    ${fieldName}: ${mockValue}`;
-}
-
-/**
- * Returns appropriate mock values for GraphQL scalar types.
- */
-function getPrimitiveMockValue(typeName: string, fieldName: string): string {
-  switch (typeName) {
-    case 'String':
-      return `'${fieldName}'`;
-    case 'Int':
-    case 'Float':
-      return '1';
-    case 'Boolean':
-      return 'true';
-    case 'ID':
-      return "'a'";
-    default:
-      return "'a'"; // fallback for custom scalars
-  }
 }
 
 /**
@@ -216,8 +379,15 @@ function generateOperationMocks(
   documents: Types.DocumentFile[],
   typesFile?: string,
   useGeneratedTypes?: boolean,
+  allFragments: LoadedFragment[] = [],
+  queryTypesFile?: string,
+  scalarsMap?: ParsedScalarsMap,
+  enumValuesMap?: ParsedEnumValuesMap,
+  enumsAsConst = false,
 ): string {
   const mockFunctions: string[] = [];
+
+  // Do not generate enum/scalar definitions in mocks - they should only be in query types
 
   // Import schema types when using custom types file (not preset)
   if (typesFile) {
@@ -226,7 +396,8 @@ function generateOperationMocks(
 
   // Import generated query-specific types when enabled
   if (useGeneratedTypes) {
-    mockFunctions.push(`import type * as QueryTypes from './_query-types';`, '');
+    const queryTypesPath = queryTypesFile || './_query-types';
+    mockFunctions.push(`import type * as QueryTypes from '${queryTypesPath}';`, '');
   }
 
   documents
@@ -241,7 +412,7 @@ function generateOperationMocks(
         )
         .forEach(operation => {
           const operationName = capitalize(operation.name!.value);
-          const typeSelections = findTypeSelections(schema, operation);
+          const typeSelections = findTypeSelections(schema, operation, allFragments);
 
           // Check if operation has only one root field to adjust context paths
           const { isSingle: hasSingleRoot, rootFieldName } = hasSingleRootField(operation);
@@ -261,8 +432,8 @@ function generateOperationMocks(
             // Create function name: fake_${queryname}_${contexts}
             const contextSuffix = contextToCamelCase(adjustedContextPath);
             const functionName = contextSuffix
-              ? `fake_${operationName.toLowerCase()}_${contextSuffix}`
-              : `fake_${operationName.toLowerCase()}`;
+              ? `fake_${operationName}_${contextSuffix}`
+              : `fake_${operationName}`;
 
             // Use generated interface name if useGeneratedTypes is true
             const operationType = operation.operation;
@@ -283,13 +454,16 @@ function generateOperationMocks(
                   typeSelection.contextPath,
                   hasSingleRoot,
                   rootFieldName,
+                  scalarsMap,
+                  enumValuesMap,
                 ),
               )
+              .filter(field => field.trim().length > 0) // Remove empty fields
               .join(',\n');
 
             const mockFunction = `export const ${functionName} = (overrides?: Partial<${interfaceName}>): ${interfaceName} => {
   return {
-${mockFields},
+${mockFields ? mockFields + ',' : ''}
     ...overrides,
   };
 };`;
@@ -318,9 +492,32 @@ ${mockFields},
  * 1. First pass: Collect all type selections across all operations
  * 2. Second pass: Generate interfaces with proper cross-references
  */
-function generateQueryTypes_impl(schema: GraphQLSchema, documents: Types.DocumentFile[]): string {
+function generateQueryTypes_impl(
+  schema: GraphQLSchema,
+  documents: Types.DocumentFile[],
+  allFragments: LoadedFragment[] = [],
+  scalarsMap?: ParsedScalarsMap,
+  enumValuesMap?: ParsedEnumValuesMap,
+  enumsAsConst = false,
+): string {
   const typeInterfaces: string[] = [];
   const generatedTypes = new Set<string>(); // Track generated interfaces to avoid duplicates
+
+  // Generate enum definitions first if we have enums
+  if (enumValuesMap) {
+    const enumDefinitions = generateEnumDefinitions(schema, enumValuesMap, enumsAsConst);
+    if (enumDefinitions) {
+      typeInterfaces.push(enumDefinitions, '');
+    }
+  }
+
+  // Generate scalar definitions if we have scalars
+  if (scalarsMap) {
+    const scalarDefinitions = generateScalarDefinitions(scalarsMap);
+    if (scalarDefinitions) {
+      typeInterfaces.push(scalarDefinitions, '');
+    }
+  }
 
   // FIRST PASS: Map all operation types to their selected fields
   const allTypeSelections = new Map<string, Set<string>>();
@@ -337,7 +534,7 @@ function generateQueryTypes_impl(schema: GraphQLSchema, documents: Types.Documen
         )
         .forEach(operation => {
           const operationName = capitalize(operation.name!.value);
-          const typeSelections = findTypeSelections(schema, operation);
+          const typeSelections = findTypeSelections(schema, operation, allFragments);
 
           // Check if operation has only one root field to adjust context paths
           const { isSingle: hasSingleRoot, rootFieldName } = hasSingleRootField(operation);
@@ -377,7 +574,7 @@ function generateQueryTypes_impl(schema: GraphQLSchema, documents: Types.Documen
         )
         .forEach(operation => {
           const operationName = capitalize(operation.name!.value);
-          const typeSelections = findTypeSelections(schema, operation);
+          const typeSelections = findTypeSelections(schema, operation, allFragments);
 
           // Check if operation has only one root field to adjust context paths
           const { isSingle: hasSingleRoot, rootFieldName } = hasSingleRootField(operation);
@@ -406,6 +603,11 @@ function generateQueryTypes_impl(schema: GraphQLSchema, documents: Types.Documen
               // Generate interface with only selected fields
               const interfaceFields = Array.from(typeSelection.selectedFields)
                 .map(field => {
+                  // Handle special __typename field first
+                  if (field === '__typename') {
+                    return `  ${field}: '${typeSelection.typeName}';`;
+                  }
+
                   // Get the field type from the schema
                   const schemaType = schema.getType(typeSelection.typeName);
                   if (schemaType && isObjectType(schemaType)) {
@@ -416,12 +618,29 @@ function generateQueryTypes_impl(schema: GraphQLSchema, documents: Types.Documen
 
                       let fieldType = 'string'; // default fallback
 
-                      if (baseType.name === 'String') fieldType = 'string';
+                      // Handle scalar types
+                      if (scalarsMap && scalarsMap[baseType.name]) {
+                        // Check if it's a custom scalar (not a built-in GraphQL scalar)
+                        if (['String', 'Int', 'Float', 'Boolean', 'ID'].includes(baseType.name)) {
+                          // Use simple type for built-in scalars
+                          if (baseType.name === 'String' || baseType.name === 'ID')
+                            fieldType = 'string';
+                          else if (baseType.name === 'Int' || baseType.name === 'Float')
+                            fieldType = 'number';
+                          else if (baseType.name === 'Boolean') fieldType = 'boolean';
+                        } else {
+                          // Use Scalars reference for custom scalars
+                          fieldType = `Scalars['${baseType.name}']['output']`;
+                        }
+                      } else if (baseType.name === 'String') fieldType = 'string';
                       else if (baseType.name === 'Int' || baseType.name === 'Float')
                         fieldType = 'number';
                       else if (baseType.name === 'Boolean') fieldType = 'boolean';
                       else if (baseType.name === 'ID') fieldType = 'string';
-                      else {
+                      else if (isEnumType(baseType)) {
+                        // Handle enum types
+                        fieldType = baseType.name;
+                      } else {
                         // Check if this is an object type that we're generating an interface for
                         // Build the referenced interface name with proper context
                         const fieldContextPath = typeSelection.contextPath
@@ -512,6 +731,7 @@ function hasSingleRootField(operation: OperationDefinitionNode): {
 function findTypeSelections(
   schema: GraphQLSchema,
   operation: OperationDefinitionNode,
+  allFragments: LoadedFragment[] = [],
 ): TypeFieldSelection[] {
   const typeSelections = new Map<string, TypeFieldSelection>(); // Map by contextPath
 
@@ -529,6 +749,7 @@ function findTypeSelections(
       typeSelections,
       rootType,
       '',
+      allFragments,
     );
   }
 
@@ -555,6 +776,7 @@ function collectTypeSelectionsIteratively(
   typeSelections: Map<string, TypeFieldSelection>,
   initialParentType: any,
   initialContextPath: string = '',
+  allFragments: LoadedFragment[] = [],
 ) {
   // Queue of selections to process: [{ selections, parentType, contextPath }]
   let processingQueue = [
@@ -568,55 +790,94 @@ function collectTypeSelectionsIteratively(
   // Process queue until empty (breadth-first traversal)
   while (processingQueue.length > 0) {
     // Process current level and build next level queue
-    processingQueue = processingQueue.flatMap(({ selections, parentType, contextPath }) =>
-      selections
-        .filter(selection => selection.kind === Kind.FIELD) // Only process field selections
-        .map(selection => selection as FieldNode)
-        .filter(field => isObjectType(parentType) && parentType.getFields()[field.name.value]) // Valid fields only
-        .flatMap(field => {
-          const fieldDef = parentType.getFields()[field.name.value];
-          const fieldType = getBaseType(fieldDef.type); // Unwrap NonNull/List wrappers
+    processingQueue = processingQueue.flatMap(({ selections, parentType, contextPath }) => {
+      const nextLevelItems: any[] = [];
 
-          // Track object types and their selected fields
-          if (isObjectType(fieldType)) {
-            const typeName = fieldType.name;
-            const newContextPath = contextPath
-              ? `${contextPath}.${field.name.value}`
-              : field.name.value;
-            const contextKey = `${typeName}@${newContextPath}`;
+      for (const selection of selections) {
+        if (selection.kind === Kind.FIELD) {
+          // Handle field selections
+          const field = selection as FieldNode;
+          if (isObjectType(parentType) && parentType.getFields()[field.name.value]) {
+            const fieldDef = parentType.getFields()[field.name.value];
+            const fieldType = getBaseType(fieldDef.type); // Unwrap NonNull/List wrappers
 
-            // Initialize type selection for this context
-            if (!typeSelections.has(contextKey)) {
-              typeSelections.set(contextKey, {
-                typeName,
-                contextPath: newContextPath,
-                selectedFields: new Set(),
-              });
-            }
+            // Track object types and their selected fields
+            if (isObjectType(fieldType)) {
+              const typeName = fieldType.name;
+              const newContextPath = contextPath
+                ? `${contextPath}.${field.name.value}`
+                : field.name.value;
+              const contextKey = `${typeName}@${newContextPath}`;
 
-            // Process nested selections if they exist
-            if (field.selectionSet) {
-              // Record all selected fields for this type in this context
-              field.selectionSet.selections
-                .filter(nestedSelection => nestedSelection.kind === Kind.FIELD)
-                .forEach(nestedSelection => {
-                  const nestedField = nestedSelection as FieldNode;
-                  typeSelections.get(contextKey)!.selectedFields.add(nestedField.name.value);
+              // Initialize type selection for this context
+              if (!typeSelections.has(contextKey)) {
+                typeSelections.set(contextKey, {
+                  typeName,
+                  contextPath: newContextPath,
+                  selectedFields: new Set(),
                 });
+              }
 
-              // Queue nested selections for next iteration
-              return [
-                {
+              // Process nested selections if they exist
+              if (field.selectionSet) {
+                // Record all selected fields for this type in this context
+                field.selectionSet.selections
+                  .filter(nestedSelection => nestedSelection.kind === Kind.FIELD)
+                  .forEach(nestedSelection => {
+                    const nestedField = nestedSelection as FieldNode;
+                    typeSelections.get(contextKey)!.selectedFields.add(nestedField.name.value);
+                  });
+
+                // Also expand fragment spreads within field selection sets
+                field.selectionSet.selections
+                  .filter(nestedSelection => nestedSelection.kind === Kind.FRAGMENT_SPREAD)
+                  .forEach(nestedSelection => {
+                    const fragmentSpread = nestedSelection as FragmentSpreadNode;
+                    const fragmentName = fragmentSpread.name.value;
+                    const fragmentDef = allFragments.find(frag => frag.name === fragmentName);
+
+                    if (fragmentDef && fragmentDef.onType === fieldType.name) {
+                      // Add all fields from the fragment to the current type
+                      fragmentDef.node.selectionSet.selections
+                        .filter(fragSelection => fragSelection.kind === Kind.FIELD)
+                        .forEach(fragSelection => {
+                          const fragField = fragSelection as FieldNode;
+                          typeSelections.get(contextKey)!.selectedFields.add(fragField.name.value);
+                        });
+                    }
+                  });
+
+                // Queue nested selections for next iteration
+                nextLevelItems.push({
                   selections: field.selectionSet.selections,
                   parentType: fieldType,
                   contextPath: newContextPath,
-                },
-              ];
+                });
+              }
             }
           }
+        } else if (selection.kind === Kind.FRAGMENT_SPREAD) {
+          // Handle fragment spread selections
+          const fragmentSpread = selection as FragmentSpreadNode;
+          const fragmentName = fragmentSpread.name.value;
 
-          return []; // No nested selections to queue
-        }),
-    );
+          // Find the fragment definition
+          const fragmentDef = allFragments.find(frag => frag.name === fragmentName);
+          if (fragmentDef && fragmentDef.onType === parentType.name) {
+            // Add fragment selections to the current processing queue
+            nextLevelItems.push({
+              selections: fragmentDef.node.selectionSet.selections,
+              parentType,
+              contextPath,
+            });
+          }
+        }
+      }
+
+      return nextLevelItems;
+    });
   }
+
+  // Convert Map to TypeFieldSelection array
+  return Array.from(typeSelections.values());
 }

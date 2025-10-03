@@ -1,11 +1,20 @@
-scalar Date
+scalar LocalDate
+
+enum TYPE {
+  POST
+  COMMENT
+}
 
 type Message {
   id: String!
   description: String!
-  author: Author
-  date: Date
+  authors: [Author!]!
+  date: LocalDate
   replyTo: Message
+  type: TYPE!
+  active: Boolean
+  numberOfComments: Int
+  cost: Float
 }
 
 type Author {

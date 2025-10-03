@@ -1,19 +1,26 @@
+fragment authorfields on Author {
+  id
+  name
+}
+
 query messages($tab: String!) {
   messages(tab: $tab) {
+    __typename
     id
-    author {
-      name
-      adress {
-        street
-        city
-        country
-      }
+    type
+    active
+    numberOfComments
+    cost
+    authors {
+      __typename
+      ...authorfields
     }
     date
     replyTo {
       id
-      author {
-        name
+      type
+      authors {
+        ...authorfields
       }
     }
   }

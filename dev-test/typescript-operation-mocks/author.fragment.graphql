@@ -1,0 +1,4 @@
+fragment authorfields on Author {
+  id
+  name
+}

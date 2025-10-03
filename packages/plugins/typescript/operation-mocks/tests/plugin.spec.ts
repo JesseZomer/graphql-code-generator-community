@@ -1,34 +1,36 @@
-import { buildSchema, parse } from 'graphql';
+import { buildASTSchema, parse } from 'graphql';
 import { describe, expect, it } from 'vitest';
 import { plugin } from '../src';
 
 describe('TypeScript Operation Mocks Plugin', () => {
-  const schema = buildSchema(/* GraphQL */ `
-    type Message {
-      id: String!
-      description: String!
-    }
+  const schema = buildASTSchema(
+    parse(/* GraphQL */ `
+      type Message {
+        id: String!
+        description: String!
+      }
 
-    type Query {
-      messages(tab: String!): [Message]
-    }
+      type Query {
+        messages(tab: String!): [Message]
+      }
 
-    input CreateMessageInput {
-      description: String!
-    }
+      input CreateMessageInput {
+        description: String!
+      }
 
-    type Mutation {
-      createMessage(args: CreateMessageInput!): Message
-      approve(id: ID!): Message
-      decline(id: ID!, reason: String!): Message
-      escalate(id: ID!): Message
-    }
+      type Mutation {
+        createMessage(args: CreateMessageInput!): Message
+        approve(id: ID!): Message
+        decline(id: ID!, reason: String!): Message
+        escalate(id: ID!): Message
+      }
 
-    schema {
-      query: Query
-      mutation: Mutation
-    }
-  `);
+      schema {
+        query: Query
+        mutation: Mutation
+      }
+    `),
+  );
 
   it('Should generate mock functions for query operations', async () => {
     const documents = [
@@ -49,7 +51,7 @@ describe('TypeScript Operation Mocks Plugin', () => {
     });
 
     expect(result).toContain("import * as Types from '../types';");
-    expect(result).toContain('export const fake_getmessages');
+    expect(result).toContain('export const fake_GetMessages');
     expect(result).toContain('(overrides?: Partial<Message>): Message');
     expect(result).toContain("id: 'id'");
   });
@@ -73,7 +75,7 @@ describe('TypeScript Operation Mocks Plugin', () => {
       typesFile: '../types',
     });
 
-    expect(result).toContain('export const fake_createmessage');
+    expect(result).toContain('export const fake_CreateMessage');
     expect(result).toContain('(overrides?: Partial<Message>): Message');
   });
 
@@ -107,28 +109,30 @@ describe('TypeScript Operation Mocks Plugin', () => {
       typesFile: '../types',
     });
 
-    expect(result).toContain('fake_getmessages');
-    expect(result).toContain('fake_approve');
-    expect(result).toContain('fake_decline');
+    expect(result).toContain('fake_GetMessages');
+    expect(result).toContain('fake_Approve');
+    expect(result).toContain('fake_Decline');
   });
 
   it('Should handle multiple root fields by keeping the root field name', async () => {
-    const multiFieldSchema = buildSchema(/* GraphQL */ `
-      type Message {
-        id: String!
-        description: String!
-      }
+    const multiFieldSchema = buildASTSchema(
+      parse(/* GraphQL */ `
+        type Message {
+          id: String!
+          description: String!
+        }
 
-      type User {
-        id: String!
-        name: String!
-      }
+        type User {
+          id: String!
+          name: String!
+        }
 
-      type Query {
-        messages(tab: String!): [Message]
-        users: [User]
-      }
-    `);
+        type Query {
+          messages(tab: String!): [Message]
+          users: [User]
+        }
+      `),
+    );
 
     const documents = [
       {
@@ -151,8 +155,8 @@ describe('TypeScript Operation Mocks Plugin', () => {
     });
 
     // For multiple root fields, should keep the root field names
-    expect(result).toContain('fake_getdata_messages');
-    expect(result).toContain('fake_getdata_users');
+    expect(result).toContain('fake_GetData_messages');
+    expect(result).toContain('fake_GetData_users');
   });
 
   it('Should handle operations without names gracefully', async () => {
@@ -204,22 +208,24 @@ describe('TypeScript Operation Mocks Plugin', () => {
   });
 
   it('Should generate interfaces for multiple types in the same operation', async () => {
-    const extendedSchema = buildSchema(/* GraphQL */ `
-      type Message {
-        id: String!
-        description: String!
-        author: Author!
-      }
+    const extendedSchema = buildASTSchema(
+      parse(/* GraphQL */ `
+        type Message {
+          id: String!
+          description: String!
+          author: Author!
+        }
 
-      type Author {
-        name: String!
-        email: String!
-      }
+        type Author {
+          name: String!
+          email: String!
+        }
 
-      type Query {
-        messages(tab: String!): [Message]
-      }
-    `);
+        type Query {
+          messages(tab: String!): [Message]
+        }
+      `),
+    );
 
     const documents = [
       {
