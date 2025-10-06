@@ -26,15 +26,18 @@ export interface Query_Messages {
   active: boolean | null;
   numberOfComments: number | null;
   cost: number | null;
+  comments: string[];
   authors: Query_Messages_Authors[];
   date: Scalars['LocalDate']['output'] | null;
   replyTo: Query_Messages_ReplyTo | null;
+  food: Query_Messages_Food_Potato | Query_Messages_Food_Tomato | null;
 }
 
 export interface Query_Messages_Authors {
   __typename: 'Author';
   id: string;
   name: string;
+  address: Query_Messages_Authors_Address | null;
 }
 
 export interface Query_Messages_ReplyTo {
@@ -46,4 +49,34 @@ export interface Query_Messages_ReplyTo {
 export interface Query_Messages_ReplyTo_Authors {
   id: string;
   name: string;
+  address: Query_Messages_ReplyTo_Authors_Address | null;
+}
+
+export interface Query_Messages_Authors_Address {
+  street: string;
+  city: string;
+  country: string | null;
+}
+
+export interface Query_Messages_Food_Potato {
+  id: string;
+  size: number;
+  color: string;
+}
+
+export interface Query_Messages_Food_Tomato {
+  id: string;
+  origin: Query_Messages_Food_Tomato_Origin;
+}
+
+export interface Query_Messages_ReplyTo_Authors_Address {
+  street: string;
+  city: string;
+  country: string | null;
+}
+
+export interface Query_Messages_Food_Tomato_Origin {
+  street: string;
+  city: string;
+  country: string | null;
 }

@@ -1,4 +1,27 @@
 fragment authorfields on Author {
   id
   name
+  address {
+    ...adressfields
+  }
+}
+
+fragment adressfields on Address {
+  street
+  city
+  country
+}
+
+fragment foodfields on Food {
+  ... on Potato {
+    id
+    size
+    color
+  }
+  ... on Tomato {
+    id
+    origin {
+      ...adressfields
+    }
+  }
 }

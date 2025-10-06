@@ -3,10 +3,12 @@ import {
   FragmentDefinitionNode,
   FragmentSpreadNode,
   GraphQLSchema,
+  InlineFragmentNode,
   isEnumType,
   isListType,
   isNonNullType,
   isObjectType,
+  isUnionType,
   Kind,
   OperationDefinitionNode,
 } from 'graphql';
@@ -298,6 +300,7 @@ function generateMockFieldValue(
   rootFieldName?: string,
   scalarsMap?: ParsedScalarsMap,
   enumValuesMap?: ParsedEnumValuesMap,
+  arrayIndex?: string,
 ): string {
   const schemaType = schema.getType(typeName);
 
@@ -349,10 +352,21 @@ function generateMockFieldValue(
 
     // Check if this field is a list type and wrap with array if needed
     if (isFieldListType(fieldDef.type)) {
-      return `    ${fieldName}: [${referencedFunctionName}()]`;
+      if (arrayIndex && arrayIndex !== "''" && arrayIndex !== '""' && arrayIndex !== "''") {
+        // For array contexts, include parent index to ensure uniqueness
+        return `    ${fieldName}: [${referencedFunctionName}(\`\${${arrayIndex}}_0\`), ${referencedFunctionName}(\`\${${arrayIndex}}_1\`)]`;
+      } else {
+        // For non-array contexts, use simple indices
+        return `    ${fieldName}: [${referencedFunctionName}('0'), ${referencedFunctionName}('1')]`;
+      }
     }
 
-    return `    ${fieldName}: ${referencedFunctionName}()`;
+    // For non-array nested objects, pass along the array index if we have one
+    if (arrayIndex && arrayIndex !== "''" && arrayIndex !== '""' && arrayIndex !== "''") {
+      return `    ${fieldName}: ${referencedFunctionName}(\`\${${arrayIndex}}\`)`;
+    } else {
+      return `    ${fieldName}: ${referencedFunctionName}('')`;
+    }
   }
 
   // Check if this is an enum type
@@ -361,12 +375,131 @@ function generateMockFieldValue(
     const enumValues = baseType.getValues();
     if (enumValues.length > 0) {
       const firstValue = enumValues[0].value;
+      // Check if this field is a list type
+      if (isFieldListType(fieldDef.type)) {
+        return `    ${fieldName}: ['${firstValue}', '${firstValue}']`;
+      }
       // Always use string literal for enum values to maintain type-only imports
       return `    ${fieldName}: '${firstValue}'`;
     }
   }
 
+  // Check if this is a union type
+  if (isUnionType(baseType)) {
+    // Find all union member mock functions for this field
+    const fieldContextPath = currentContextPath ? `${currentContextPath}.${fieldName}` : fieldName;
+
+    // Adjust context path for single root field operations
+    let adjustedContextPath = fieldContextPath;
+    if (hasSingleRoot && rootFieldName && adjustedContextPath.startsWith(rootFieldName)) {
+      adjustedContextPath =
+        adjustedContextPath === rootFieldName
+          ? ''
+          : adjustedContextPath.substring(rootFieldName.length + 1);
+    }
+
+    const unionMemberFunctions = [];
+    const unionTypes = baseType.getTypes();
+
+    for (const unionMemberType of unionTypes) {
+      // Check if we have a type selection for this union member
+      const unionMemberContextPath = `${fieldContextPath}.${unionMemberType.name}`;
+      const unionMemberSelection = allTypeSelections.find(
+        selection =>
+          selection.typeName === unionMemberType.name &&
+          selection.contextPath === unionMemberContextPath,
+      );
+
+      if (unionMemberSelection) {
+        // Adjust context path for single root field operations
+        let adjustedUnionMemberContextPath = unionMemberContextPath;
+        if (
+          hasSingleRoot &&
+          rootFieldName &&
+          adjustedUnionMemberContextPath.startsWith(rootFieldName)
+        ) {
+          adjustedUnionMemberContextPath =
+            adjustedUnionMemberContextPath === rootFieldName
+              ? ''
+              : adjustedUnionMemberContextPath.substring(rootFieldName.length + 1);
+        }
+
+        // Create the mock function name for this union member using the same naming as the actual generated functions
+        const contextSuffix = contextToCamelCase(adjustedUnionMemberContextPath);
+        const unionMemberFunctionName = contextSuffix
+          ? `fake_${operationName}_${contextSuffix}`
+          : `fake_${operationName}`;
+
+        unionMemberFunctions.push(unionMemberFunctionName);
+      }
+    }
+
+    if (unionMemberFunctions.length > 0) {
+      // For lists, create array with both union members
+      if (isFieldListType(fieldDef.type)) {
+        if (arrayIndex && arrayIndex !== "''" && arrayIndex !== '""' && arrayIndex !== "''") {
+          // For array contexts, include parent index to ensure uniqueness
+          const unionCalls = unionMemberFunctions
+            .map((fn, idx) => `${fn}(\`\${${arrayIndex}}_${idx}\`)`)
+            .join(', ');
+          return `    ${fieldName}: [${unionCalls}]`;
+        } else {
+          // For non-array contexts, use simple indices
+          const unionCalls = unionMemberFunctions.map((fn, idx) => `${fn}('${idx}')`).join(', ');
+          return `    ${fieldName}: [${unionCalls}]`;
+        }
+      } else {
+        // For single union values, pick the first one (or could be random)
+        const selectedFunction = unionMemberFunctions[0];
+        if (arrayIndex && arrayIndex !== "''" && arrayIndex !== '""' && arrayIndex !== "''") {
+          return `    ${fieldName}: ${selectedFunction}(\`\${${arrayIndex}}\`)`;
+        } else {
+          return `    ${fieldName}: ${selectedFunction}('')`;
+        }
+      }
+    }
+
+    // Fallback if no union member mock functions found
+    return `    ${fieldName}: null`;
+  }
+
   // Handle scalar types (both built-in and custom)
+  // Check if this field is a list type for scalars
+  if (isFieldListType(fieldDef.type)) {
+    // Handle array of scalars
+    if (baseType.name === 'String' || baseType.name === 'ID') {
+      return `    ${fieldName}: ['${fieldName}_0', '${fieldName}_1']`;
+    } else if (baseType.name === 'Int') {
+      return `    ${fieldName}: [1, 2]`;
+    } else if (baseType.name === 'Float') {
+      return `    ${fieldName}: [1.0, 2.0]`;
+    } else if (baseType.name === 'Boolean') {
+      return `    ${fieldName}: [true, false]`;
+    } else if (scalarsMap && scalarsMap[baseType.name]) {
+      // Custom scalar arrays
+      const scalarConfig = scalarsMap[baseType.name];
+      const scalarType = (scalarConfig as any).output?.type || scalarConfig.type || 'any';
+      const customMockValue = getScalarMockValue(scalarType, fieldName);
+      return `    ${fieldName}: [${customMockValue}, ${customMockValue}]`;
+    } else {
+      // Fallback for unknown scalar arrays
+      return `    ${fieldName}: ['${fieldName}_0', '${fieldName}_1']`;
+    }
+  }
+
+  // Handle scalar types (both built-in and custom)
+  // Special handling for ID fields to create unique identifiers
+  if (baseType.name === 'ID' || fieldName === 'id') {
+    const contextPart = currentContextPath.replace(/\./g, '_');
+    if (arrayIndex && arrayIndex !== "''" && arrayIndex !== '""' && arrayIndex !== "''") {
+      // For array contexts, use template literal with dynamic index
+      return `    ${fieldName}: \`${contextPart}_${fieldName}_\${${arrayIndex}}\``;
+    } else {
+      // For non-array contexts, but still use the arrayIndex if available for unique IDs
+      return `    ${fieldName}: \`${contextPart}_${fieldName}\${arrayIndex ? \`_\${arrayIndex}\` : ''}\``;
+    }
+  }
+
   // First check for custom scalars
   if (scalarsMap && scalarsMap[baseType.name]) {
     const scalarConfig = scalarsMap[baseType.name];
@@ -484,6 +617,7 @@ function generateOperationMocks(
                   rootFieldName,
                   scalarsMap,
                   enumValuesMap,
+                  isRootArrayField ? 'i' : undefined, // Pass array index variable for array contexts
                 ),
               )
               .filter(field => field.trim().length > 0) // Remove empty fields
@@ -500,8 +634,8 @@ ${mockFields ? mockFields + ',' : ''}
   }));
 };`;
             } else {
-              // Generate a function that returns a single object
-              mockFunction = `export const ${functionName} = (overrides?: Partial<${interfaceName}>): ${interfaceName} => {
+              // All non-array functions accept optional arrayIndex for unique ID generation
+              mockFunction = `export const ${functionName} = (arrayIndex: string = '', overrides?: Partial<${interfaceName}>): ${interfaceName} => {
   return {
 ${mockFields ? mockFields + ',' : ''}
     ...overrides,
@@ -681,6 +815,45 @@ function generateQueryTypes_impl(
                       else if (isEnumType(baseType)) {
                         // Handle enum types
                         fieldType = baseType.name;
+                      } else if (isUnionType(baseType)) {
+                        // Handle union types - find all generated union member interfaces
+                        const fieldContextPath = typeSelection.contextPath
+                          ? `${typeSelection.contextPath}.${field}`
+                          : field;
+
+                        // Adjust context path for single root field operations
+                        let adjustedFieldContextPath = fieldContextPath;
+                        if (
+                          hasSingleRoot &&
+                          rootFieldName &&
+                          adjustedFieldContextPath.startsWith(rootFieldName)
+                        ) {
+                          adjustedFieldContextPath =
+                            adjustedFieldContextPath === rootFieldName
+                              ? ''
+                              : adjustedFieldContextPath.substring(rootFieldName.length + 1);
+                        }
+
+                        // Look for all union member interfaces for this field
+                        const unionMemberTypes = [];
+                        const unionTypes = baseType.getTypes();
+
+                        for (const unionMemberType of unionTypes) {
+                          // Build the union member context path: field.MemberType
+                          const unionMemberContextPath = adjustedFieldContextPath
+                            ? `${adjustedFieldContextPath}.${unionMemberType.name}`
+                            : unionMemberType.name;
+                          const unionMemberInterfaceName = `${basePrefix}_${operationName}${contextToPascalCase(unionMemberContextPath)}`;
+                          if (allTypeSelections.has(unionMemberInterfaceName)) {
+                            unionMemberTypes.push(unionMemberInterfaceName);
+                          }
+                        }
+
+                        if (unionMemberTypes.length > 0) {
+                          fieldType = unionMemberTypes.join(' | ');
+                        } else {
+                          fieldType = baseType.name; // Use the schema type name as fallback
+                        }
                       } else {
                         // Check if this is an object type that we're generating an interface for
                         // Build the referenced interface name with proper context
@@ -797,6 +970,7 @@ function findTypeSelections(
       rootType,
       '',
       allFragments,
+      schema,
     );
   }
 
@@ -824,6 +998,7 @@ function collectTypeSelectionsIteratively(
   initialParentType: any,
   initialContextPath: string = '',
   allFragments: LoadedFragment[] = [],
+  schema: GraphQLSchema,
 ) {
   // Queue of selections to process: [{ selections, parentType, contextPath }]
   let processingQueue = [
@@ -901,6 +1076,20 @@ function collectTypeSelectionsIteratively(
                   contextPath: newContextPath,
                 });
               }
+            } else if (isUnionType(fieldType)) {
+              // Handle union type fields - process selections with union type as parent
+              if (field.selectionSet) {
+                const newContextPath = contextPath
+                  ? `${contextPath}.${field.name.value}`
+                  : field.name.value;
+
+                // Queue selections for processing with union type as parent
+                nextLevelItems.push({
+                  selections: field.selectionSet.selections,
+                  parentType: fieldType,
+                  contextPath: newContextPath,
+                });
+              }
             }
           }
         } else if (selection.kind === Kind.FRAGMENT_SPREAD) {
@@ -910,13 +1099,58 @@ function collectTypeSelectionsIteratively(
 
           // Find the fragment definition
           const fragmentDef = allFragments.find(frag => frag.name === fragmentName);
-          if (fragmentDef && fragmentDef.onType === parentType.name) {
+          if (
+            fragmentDef &&
+            (fragmentDef.onType === parentType.name ||
+              (isUnionType(parentType) &&
+                parentType.getTypes().some(t => t.name === fragmentDef.onType)))
+          ) {
             // Add fragment selections to the current processing queue
             nextLevelItems.push({
               selections: fragmentDef.node.selectionSet.selections,
               parentType,
               contextPath,
             });
+          }
+        } else if (selection.kind === Kind.INLINE_FRAGMENT) {
+          // Handle inline fragment selections (for union types)
+          const inlineFragment = selection as InlineFragmentNode;
+          if (inlineFragment.typeCondition) {
+            const fragmentTypeName = inlineFragment.typeCondition.name.value;
+            const fragmentType = schema.getType(fragmentTypeName);
+
+            if (fragmentType && isObjectType(fragmentType)) {
+              // Create a type selection for this union member
+              // Context path should include the union member type name
+              const unionMemberContextPath = contextPath
+                ? `${contextPath}.${fragmentTypeName}`
+                : fragmentTypeName;
+              const contextKey = `${fragmentTypeName}@${unionMemberContextPath}`;
+
+              // Initialize type selection for this union member
+              if (!typeSelections.has(contextKey)) {
+                typeSelections.set(contextKey, {
+                  typeName: fragmentTypeName,
+                  contextPath: unionMemberContextPath,
+                  selectedFields: new Set(),
+                });
+              }
+
+              // Record fields selected in this inline fragment
+              inlineFragment.selectionSet.selections
+                .filter(fragSelection => fragSelection.kind === Kind.FIELD)
+                .forEach(fragSelection => {
+                  const fragField = fragSelection as FieldNode;
+                  typeSelections.get(contextKey)!.selectedFields.add(fragField.name.value);
+                });
+
+              // Queue nested selections for processing
+              nextLevelItems.push({
+                selections: inlineFragment.selectionSet.selections,
+                parentType: fragmentType,
+                contextPath: unionMemberContextPath,
+              });
+            }
           }
         }
       }

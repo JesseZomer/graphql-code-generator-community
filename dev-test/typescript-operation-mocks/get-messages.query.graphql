@@ -1,8 +1,3 @@
-fragment authorfields on Author {
-  id
-  name
-}
-
 query messages($tab: String!) {
   messages(tab: $tab) {
     __typename
@@ -11,6 +6,7 @@ query messages($tab: String!) {
     active
     numberOfComments
     cost
+    comments
     authors {
       __typename
       ...authorfields
@@ -22,6 +18,9 @@ query messages($tab: String!) {
       authors {
         ...authorfields
       }
+    }
+    food {
+      ...foodfields
     }
   }
 }

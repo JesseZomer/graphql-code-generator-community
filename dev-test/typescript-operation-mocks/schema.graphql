@@ -13,17 +13,33 @@ type Message {
   replyTo: Message
   type: TYPE!
   active: Boolean
+  comments: [String]!
   numberOfComments: Int
   cost: Float
+  food: Food
+}
+
+union Food = Potato | Tomato
+
+type Potato {
+  id: ID!
+  size: Int!
+  color: String!
+}
+
+type Tomato {
+  id: ID!
+  size: Int!
+  origin: Address!
 }
 
 type Author {
   id: String!
   name: String!
-  adress: Adress
+  address: Address
 }
 
-type Adress {
+type Address {
   street: String!
   city: String!
   country: String
