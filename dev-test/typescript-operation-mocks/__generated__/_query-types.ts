@@ -1,82 +1,141 @@
-export const TYPE = {
-  COMMENT: 'COMMENT',
-  POST: 'POST',
-} as const;
+import type * as QueryTypes from './_query-types.types';
 
-export type TYPE = (typeof TYPE)[keyof typeof TYPE];
-
-/** All built-in and custom scalars, mapped to their actual values */
-export type Scalars = {
-  ID: { input: string; output: string };
-  String: { input: string; output: string };
-  Boolean: { input: boolean; output: boolean };
-  Int: { input: number; output: number };
-  Float: { input: number; output: number };
-  LocalDate: { input: Date; output: Date };
+export const fake_CreateMessage = (
+  overrides?: Partial<Types.Mutation_CreateMessage>,
+  arrayIndex = '',
+): Types.Mutation_CreateMessage => {
+  return {
+    __typename: 'Message',
+    id: `createMessage_id${arrayIndex ? `_${arrayIndex}` : ''}`,
+    ...overrides,
+  };
 };
 
-export interface Mutation_CreateMessage {
-  id: string;
-}
+export const fake_Messages = (
+  overrides?: Partial<Types.Query_Messages>[],
+  length: number = 2,
+): Types.Query_Messages[] => {
+  return Array.from({ length }, (_, i) => ({
+    __typename: 'Message',
+    id: `messages_id_${i}`,
+    type: Types.Type.COMMENT,
+    active: true,
+    numberOfComments: 1,
+    cost: 1.0,
+    comments: ['comments_0', 'comments_1'],
+    authors: [
+      fake_Messages_authors(undefined, `${i}_0`),
+      fake_Messages_authors(undefined, `${i}_1`),
+    ],
+    date: new Date(),
+    replyTo: fake_Messages_replyTo(undefined, `${i}`),
+    food: fake_Messages_food_Potato(undefined, `${i}`),
+    ...(overrides?.[i] || {}),
+  }));
+};
 
-export interface Query_Messages {
-  __typename: 'Message';
-  id: string;
-  type: TYPE;
-  active: boolean | null;
-  numberOfComments: number | null;
-  cost: number | null;
-  comments: string[];
-  authors: Query_Messages_Authors[];
-  date: Scalars['LocalDate']['output'] | null;
-  replyTo: Query_Messages_ReplyTo | null;
-  food: Query_Messages_Food_Potato | Query_Messages_Food_Tomato | null;
-}
+export const fake_Messages_authors = (
+  overrides?: Partial<Types.Query_Messages_Authors>,
+  arrayIndex = '',
+): Types.Query_Messages_Authors => {
+  return {
+    __typename: 'Author',
+    id: `messages_authors_id${arrayIndex ? `_${arrayIndex}` : ''}`,
+    name: 'name',
+    address: fake_Messages_authors_address(),
+    ...overrides,
+  };
+};
 
-export interface Query_Messages_Authors {
-  __typename: 'Author';
-  id: string;
-  name: string;
-  address: Query_Messages_Authors_Address | null;
-}
+export const fake_Messages_replyTo = (
+  overrides?: Partial<Types.Query_Messages_ReplyTo>,
+  arrayIndex = '',
+): Types.Query_Messages_ReplyTo => {
+  return {
+    __typename: 'Message',
+    id: `messages_replyTo_id${arrayIndex ? `_${arrayIndex}` : ''}`,
+    type: Types.Type.COMMENT,
+    authors: [
+      fake_Messages_replyTo_authors(undefined, '0'),
+      fake_Messages_replyTo_authors(undefined, '1'),
+    ],
+    ...overrides,
+  };
+};
 
-export interface Query_Messages_ReplyTo {
-  id: string;
-  type: TYPE;
-  authors: Query_Messages_ReplyTo_Authors[];
-}
+export const fake_Messages_food_Potato = (
+  overrides?: Partial<Types.Query_Messages_Food_Potato>,
+  arrayIndex = '',
+): Types.Query_Messages_Food_Potato => {
+  return {
+    __typename: 'Potato',
+    id: `messages_food_Potato_id${arrayIndex ? `_${arrayIndex}` : ''}`,
+    size: 1,
+    color: 'color',
+    ...overrides,
+  };
+};
 
-export interface Query_Messages_ReplyTo_Authors {
-  id: string;
-  name: string;
-  address: Query_Messages_ReplyTo_Authors_Address | null;
-}
+export const fake_Messages_food_Tomato = (
+  overrides?: Partial<Types.Query_Messages_Food_Tomato>,
+  arrayIndex = '',
+): Types.Query_Messages_Food_Tomato => {
+  return {
+    __typename: 'Tomato',
+    id: `messages_food_Tomato_id${arrayIndex ? `_${arrayIndex}` : ''}`,
+    origin: fake_Messages_food_Tomato_origin(),
+    ...overrides,
+  };
+};
 
-export interface Query_Messages_Authors_Address {
-  street: string;
-  city: string;
-  country: string | null;
-}
+export const fake_Messages_authors_address = (
+  overrides?: Partial<Types.Query_Messages_Authors_Address>,
+  arrayIndex = '',
+): Types.Query_Messages_Authors_Address => {
+  return {
+    __typename: 'Address',
+    street: 'street',
+    city: 'city',
+    country: 'country',
+    ...overrides,
+  };
+};
 
-export interface Query_Messages_Food_Potato {
-  id: string;
-  size: number;
-  color: string;
-}
+export const fake_Messages_replyTo_authors = (
+  overrides?: Partial<Types.Query_Messages_ReplyTo_Authors>,
+  arrayIndex = '',
+): Types.Query_Messages_ReplyTo_Authors => {
+  return {
+    __typename: 'Author',
+    id: `messages_replyTo_authors_id${arrayIndex ? `_${arrayIndex}` : ''}`,
+    name: 'name',
+    address: fake_Messages_replyTo_authors_address(),
+    ...overrides,
+  };
+};
 
-export interface Query_Messages_Food_Tomato {
-  id: string;
-  origin: Query_Messages_Food_Tomato_Origin;
-}
+export const fake_Messages_food_Tomato_origin = (
+  overrides?: Partial<Types.Query_Messages_Food_Tomato_Origin>,
+  arrayIndex = '',
+): Types.Query_Messages_Food_Tomato_Origin => {
+  return {
+    __typename: 'Address',
+    street: 'street',
+    city: 'city',
+    country: 'country',
+    ...overrides,
+  };
+};
 
-export interface Query_Messages_ReplyTo_Authors_Address {
-  street: string;
-  city: string;
-  country: string | null;
-}
-
-export interface Query_Messages_Food_Tomato_Origin {
-  street: string;
-  city: string;
-  country: string | null;
-}
+export const fake_Messages_replyTo_authors_address = (
+  overrides?: Partial<Types.Query_Messages_ReplyTo_Authors_Address>,
+  arrayIndex = '',
+): Types.Query_Messages_ReplyTo_Authors_Address => {
+  return {
+    __typename: 'Address',
+    street: 'street',
+    city: 'city',
+    country: 'country',
+    ...overrides,
+  };
+};

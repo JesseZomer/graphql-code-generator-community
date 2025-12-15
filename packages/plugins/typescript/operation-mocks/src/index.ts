@@ -1,1164 +1,1606 @@
-import {
-  FieldNode,
-  FragmentDefinitionNode,
-  FragmentSpreadNode,
-  GraphQLSchema,
-  InlineFragmentNode,
-  isEnumType,
-  isListType,
-  isNonNullType,
-  isObjectType,
-  isUnionType,
-  Kind,
-  OperationDefinitionNode,
-} from 'graphql';
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { PluginFunction, Types } from '@graphql-codegen/plugin-helpers';
 import {
-  buildScalarsFromConfig,
-  DeclarationBlock,
-  DEFAULT_SCALARS,
-  indent,
-  ParsedEnumValuesMap,
-  ParsedScalarsMap,
-  parseEnumValues,
-  transformComment,
-  wrapWithSingleQuotes,
+    ClientSideBasePluginConfig,
+    ClientSideBaseVisitor,
+    LoadedFragment,
+    RawClientSideBasePluginConfig
 } from '@graphql-codegen/visitor-plugin-common';
 import {
-  capitalize,
-  contextToCamelCase,
-  contextToPascalCase,
-  getBaseType,
-  getPrimitiveMockValue,
-  getScalarMockValue,
-} from './utils.js';
+    FragmentDefinitionNode,
+    getNamedType,
+    GraphQLSchema,
+    isEnumType,
+    isInterfaceType,
+    isObjectType,
+    isUnionType,
+    Kind,
+    OperationDefinitionNode
+} from 'graphql';
+import type { SelectionQueueItem, TypeFieldSelection } from './types';
+import { contextToCamelCase, contextToPascalCase, getBaseType, getPrimitiveMockValue, getScalarMockValue, isFieldListType } from './utils';
 
-/**
- * Check if a GraphQL type is a list type (unwrapping NonNull if needed)
- */
-function isFieldListType(type: any): boolean {
-  // Unwrap NonNull first: String! → String, [String!]! → [String!]
-  const unwrappedType = isNonNullType(type) ? type.ofType : type;
-  return isListType(unwrappedType);
+export interface OperationMocksPluginConfig extends RawClientSideBasePluginConfig {
+    /**
+     * Optional prefix for type names when referencing typescript-operations types
+     * @default "Types."
+     */
+    typePrefix?: string;
+
+    /**
+     * Override default scalar type mappings for mock generation.
+     */
+    scalars?: any;
+
+    /**
+     * When true, generate type aliases instead of mock functions.
+     * Type aliases map clean names (Query_Messages) to typescript-operations names (MessagesQuery_messages_Message).
+     * @default false
+     */
+    generateTypeAliasesOnly?: boolean;
 }
 
 /**
- * Represents a loaded fragment definition
- */
-interface LoadedFragment {
-  name: string;
-  onType: string;
-  node: FragmentDefinitionNode;
-}
-
-/**
- * Configuration options for the TypeScript Operation Mocks plugin
- */
-export interface OperationMocksPluginConfig {
-  /**
-   * @description Generate mock functions using the fake${QueryName}${SchemaType} naming pattern.
-   * These functions return objects with only the fields selected in your GraphQL operations.
-   * @default true
-   * @example fakeGetMessagesMessage(), fakeGetMessagesAuthor()
-   */
-  generateMocks?: boolean;
-
-  /**
-   * @description Generate TypeScript interfaces for selected fields only.
-   * Creates interfaces like GetMessages_Message with only the fields you actually query.
-   * Similar to extractAllFieldsToTypes in typescript-operations plugin.
-   * @default false
-   * @example GetMessages_Message { id: string; author: GetMessages_Author; }
-   */
-  generateQueryTypes?: boolean;
-
-  /**
-   * @description Path to import schema types from.
-   * @default '../types'
-   */
-  typesFile?: string;
-
-  /**
-   * @description Path to import generated query-specific types from when generateQueryTypes is enabled.
-   * @default './_query-types'
-   */
-  queryTypesFile?: string;
-
-  /**
-   * @description Allows you to override the default scalar mappings.
-   * @default { Date: 'Date' }
-   */
-  scalars?: any;
-
-  /**
-   * @description Allows you to override enum values mapping.
-   */
-  enumValues?: any;
-
-  /**
-   * @description Generates enum as TypeScript `const assertions` instead of `enum`.
-   * This generates `export const TYPE = { COMMENT: 'COMMENT' } as const` instead of regular enums.
-   * @default false
-   */
-  enumsAsConst?: boolean;
-}
-
-// Interface to track what fields are selected for each type with context path
-interface TypeFieldSelection {
-  typeName: string;
-  contextPath: string; // e.g., "Message", "Message.replyTo", "Message.replyTo.author"
-  selectedFields: Set<string>;
-}
-
-/**
- * GraphQL Code Generator plugin that creates mock functions for operations.
+ * Visitor class that extends ClientSideBaseVisitor to handle fragments across multiple documents.
  *
- * WHAT IT DOES:
- * - Analyzes your GraphQL operations (queries/mutations/subscriptions)
- * - Generates mock functions with the pattern: a{OperationName}{TypeName}
- * - Only includes fields that are actually selected in your operations
- * - Optionally generates TypeScript interfaces for field-specific types
+ * This visitor traverses GraphQL operations and their selection sets to generate mock functions
+ * and type aliases. It handles:
+ * - Fragment spreads and inline fragments
+ * - Interface and union types with concrete type variants
+ * - Nested object types
+ * - Array fields
+ * - Scalar and enum types
  *
- * EXAMPLE:
- * For a query "GetMessages" selecting { id, author { name } }:
- * - Generates: fakeGetMessagesMessage() → { id: 'id', author: fakeGetMessagesAuthor() }
- * - Generates: fakeGetMessagesAuthor() → { name: 'name' }
+ * @example
+ * ```typescript
+ * // For a GraphQL query like:
+ * // query Messages { messages { id, text, author { name } } }
+ *
+ * // Generates mock functions:
+ * // - fake_Messages(arrayIndex, overrides) - for Message[]
+ * // - fake_Messages_author(arrayIndex, overrides) - for Author
+ *
+ * // Or type aliases (when generateTypeAliasesOnly: true):
+ * // - export type Query_Messages = MessagesQuery_messages_Message;
+ * // - export type Query_Messages_Author = MessagesQuery_messages_Message_author_Author;
+ * ```
  */
-export const plugin: PluginFunction<OperationMocksPluginConfig> = (
-  schema: GraphQLSchema,
-  documents: Types.DocumentFile[],
-  config: OperationMocksPluginConfig,
-): string => {
-  // Apply defaults to configuration
-  const shouldGenerateMocks = config.generateMocks !== false; // default: true
-  const shouldGenerateTypes = config.generateQueryTypes === true; // default: false
 
-  // Build scalars and enums configuration
-  let scalarsMap: ParsedScalarsMap = {};
-  let enumValuesMap: ParsedEnumValuesMap = {};
-
-  scalarsMap = buildScalarsFromConfig(schema, config, DEFAULT_SCALARS);
-  enumValuesMap = parseEnumValues({
-    schema,
-    mapOrStr: config.enumValues || {},
-  });
-
-  // Collect all fragment definitions from all documents
-  const allFragments: LoadedFragment[] = documents
-    .filter(doc => doc.document)
-    .flatMap(
-      doc =>
-        doc.document!.definitions.filter(
-          d => d.kind === Kind.FRAGMENT_DEFINITION,
-        ) as FragmentDefinitionNode[],
-    )
-    .map(fragmentDef => ({
-      name: fragmentDef.name.value,
-      onType: fragmentDef.typeCondition.name.value,
-      node: fragmentDef,
-    }));
-
-  // Generate only TypeScript interfaces when mocks are disabled
-  if (shouldGenerateTypes && !shouldGenerateMocks) {
-    return generateQueryTypes_impl(
-      schema,
-      documents,
-      allFragments,
-      scalarsMap,
-      enumValuesMap,
-      config.enumsAsConst,
-    );
-  }
-
-  // Generate mock functions (with optional generated type usage)
-  return generateOperationMocks(
-    schema,
-    documents,
-    config.typesFile,
-    shouldGenerateTypes,
-    allFragments,
-    config.queryTypesFile,
-    scalarsMap,
-    enumValuesMap,
-    config.enumsAsConst,
-  );
+/**
+ * Lookup table for scalar list mock values.
+ * Maps GraphQL scalar type names to functions that generate mock array values.
+ */
+const SCALAR_LIST_MOCKS: Record<string, (fieldName: string) => string> = {
+    String: (f) => `['${f}_0', '${f}_1']`,
+    ID: (f) => `['${f}_0', '${f}_1']`,
+    Int: () => '[1, 2]',
+    Float: () => '[1.0, 2.0]',
+    Boolean: () => '[true, false]'
 };
 
 /**
- * Generate enum definitions for GraphQL enums in the schema
+ * Built-in GraphQL scalar types that don't need custom mock handling.
  */
-function generateEnumDefinitions(
-  schema: GraphQLSchema,
-  enumValuesMap: ParsedEnumValuesMap,
-  enumsAsConst = false,
-): string {
-  const typeMap = schema.getTypeMap();
-  const enumDefinitions: string[] = [];
-
-  Object.values(typeMap).forEach(type => {
-    if (isEnumType(type) && !type.name.startsWith('__')) {
-      const enumName = type.name;
-
-      // Skip if external enum mapping is provided
-      if (enumValuesMap[enumName]?.sourceFile) {
-        return;
-      }
-
-      const enumValues = type
-        .getValues()
-        .map(value => {
-          const configValue = enumValuesMap[enumName]?.mappedValues?.[value.name];
-          const enumValue = configValue !== undefined ? configValue : value.name;
-          const comment = value.description ? transformComment(value.description, 1) : '';
-
-          if (enumsAsConst) {
-            // For const enums: KEY: 'VALUE'
-            return comment + indent(`${value.name}: ${wrapWithSingleQuotes(enumValue)}`);
-          } else {
-            // For regular enums: KEY = 'VALUE'
-            return comment + indent(`${value.name} = ${wrapWithSingleQuotes(enumValue)}`);
-          }
-        })
-        .join(',\n');
-
-      if (enumsAsConst) {
-        // Generate const enum: export const TYPE = { ... } as const; export type TYPE = typeof TYPE[keyof typeof TYPE];
-        const constDeclaration = new DeclarationBlock({
-          blockTransformer: block => block + ' as const',
-        })
-          .export()
-          .asKind('const')
-          .withName(enumName)
-          .withComment(type.description || undefined)
-          .withBlock(enumValues).string;
-
-        const typeDeclaration = `export type ${enumName} = typeof ${enumName}[keyof typeof ${enumName}];`;
-
-        enumDefinitions.push([constDeclaration, typeDeclaration].join('\n'));
-      } else {
-        // Generate regular enum
-        const enumDefinition = new DeclarationBlock({})
-          .export()
-          .asKind('enum')
-          .withName(enumName)
-          .withComment(type.description || undefined)
-          .withBlock(enumValues).string;
-
-        enumDefinitions.push(enumDefinition);
-      }
-    }
-  });
-
-  return enumDefinitions.join('\n\n');
-}
+const BUILT_IN_GRAPHQL_TYPES = ['ID', 'String', 'Boolean', 'Int', 'Float'] as const;
 
 /**
- * Generate scalar definitions similar to the main TypeScript plugin
+ * Build a mock function name from operation name and context path.
+ * @example buildFunctionName('Messages', 'author') => 'fake_Messages_author'
+ * @example buildFunctionName('Messages', '') => 'fake_Messages'
  */
-function generateScalarDefinitions(scalarsMap: ParsedScalarsMap): string {
-  const allScalars = Object.keys(scalarsMap)
-    .map(scalarName => {
-      const scalarConfig = scalarsMap[scalarName];
-      if (!scalarConfig) {
-        console.warn(`Scalar ${scalarName} is missing configuration, skipping`);
-        return null;
-      }
-
-      // ParsedScalarsMap contains ParsedMapper objects with input/output structure
-      const scalarType = (scalarConfig as any).output?.type || scalarConfig.type || 'any';
-
-      return indent(`${scalarName}: { input: ${scalarType}; output: ${scalarType}; }`);
-    })
-    .filter(Boolean);
-
-  if (allScalars.length === 0) {
-    return '';
-  }
-
-  return new DeclarationBlock({})
-    .export()
-    .asKind('type')
-    .withName('Scalars')
-    .withComment('All built-in and custom scalars, mapped to their actual values')
-    .withBlock(allScalars.join('\n')).string;
-}
-
-// Interface to track what fields are selected for each type with context path
-interface TypeFieldSelection {
-  typeName: string;
-  contextPath: string; // e.g., "Message", "Message.replyTo", "Message.replyTo.author"
-  selectedFields: Set<string>;
-}
-function generateMockFieldValue(
-  schema: GraphQLSchema,
-  typeName: string,
-  fieldName: string,
-  operationName: string,
-  allTypeSelections: TypeFieldSelection[],
-  currentContextPath: string,
-  hasSingleRoot: boolean,
-  rootFieldName?: string,
-  scalarsMap?: ParsedScalarsMap,
-  enumValuesMap?: ParsedEnumValuesMap,
-  arrayIndex?: string,
-): string {
-  const schemaType = schema.getType(typeName);
-
-  // Safety check: ensure we have a valid object type
-  if (!schemaType || !isObjectType(schemaType)) {
-    return `    ${fieldName}: '${fieldName}'`; // fallback
-  }
-
-  const fieldDef = schemaType.getFields()[fieldName];
-
-  // Handle special __typename field
-  if (fieldName === '__typename') {
-    return `    ${fieldName}: '${typeName}'`;
-  }
-
-  if (!fieldDef) {
-    return `    ${fieldName}: '${fieldName}'`; // fallback
-  }
-
-  const baseType = getBaseType(fieldDef.type);
-  const referencedTypeName = baseType.name;
-
-  // Build the context path for this field
-
-  // Build the context path for this field
-  const fieldContextPath = currentContextPath ? `${currentContextPath}.${fieldName}` : fieldName;
-
-  // Check if this field references another object type that we have a mock for
-  const referencedTypeSelection = allTypeSelections.find(
-    selection =>
-      selection.typeName === referencedTypeName && selection.contextPath === fieldContextPath,
-  );
-
-  if (referencedTypeSelection && isObjectType(baseType)) {
-    // Adjust context path for single root field operations
-    let adjustedContextPath = referencedTypeSelection.contextPath;
-    if (hasSingleRoot && rootFieldName && adjustedContextPath.startsWith(rootFieldName)) {
-      adjustedContextPath =
-        adjustedContextPath === rootFieldName
-          ? ''
-          : adjustedContextPath.substring(rootFieldName.length + 1);
-    }
-
-    // Create the mock function name for the referenced type using new naming pattern
-    const contextSuffix = contextToCamelCase(adjustedContextPath);
-    const referencedFunctionName = contextSuffix
-      ? `fake_${operationName}_${contextSuffix}`
-      : `fake_${operationName}`;
-
-    // Check if this field is a list type and wrap with array if needed
-    if (isFieldListType(fieldDef.type)) {
-      if (arrayIndex && arrayIndex !== "''" && arrayIndex !== '""' && arrayIndex !== "''") {
-        // For array contexts, include parent index to ensure uniqueness
-        return `    ${fieldName}: [${referencedFunctionName}(\`\${${arrayIndex}}_0\`), ${referencedFunctionName}(\`\${${arrayIndex}}_1\`)]`;
-      } else {
-        // For non-array contexts, use simple indices
-        return `    ${fieldName}: [${referencedFunctionName}('0'), ${referencedFunctionName}('1')]`;
-      }
-    }
-
-    // For non-array nested objects, pass along the array index if we have one
-    if (arrayIndex && arrayIndex !== "''" && arrayIndex !== '""' && arrayIndex !== "''") {
-      return `    ${fieldName}: ${referencedFunctionName}(\`\${${arrayIndex}}\`)`;
-    } else {
-      return `    ${fieldName}: ${referencedFunctionName}('')`;
-    }
-  }
-
-  // Check if this is an enum type
-  if (isEnumType(baseType)) {
-    // Get the first enum value as a default
-    const enumValues = baseType.getValues();
-    if (enumValues.length > 0) {
-      const firstValue = enumValues[0].value;
-      // Check if this field is a list type
-      if (isFieldListType(fieldDef.type)) {
-        return `    ${fieldName}: ['${firstValue}', '${firstValue}']`;
-      }
-      // Always use string literal for enum values to maintain type-only imports
-      return `    ${fieldName}: '${firstValue}'`;
-    }
-  }
-
-  // Check if this is a union type
-  if (isUnionType(baseType)) {
-    // Find all union member mock functions for this field
-    const fieldContextPath = currentContextPath ? `${currentContextPath}.${fieldName}` : fieldName;
-
-    // Adjust context path for single root field operations
-    let adjustedContextPath = fieldContextPath;
-    if (hasSingleRoot && rootFieldName && adjustedContextPath.startsWith(rootFieldName)) {
-      adjustedContextPath =
-        adjustedContextPath === rootFieldName
-          ? ''
-          : adjustedContextPath.substring(rootFieldName.length + 1);
-    }
-
-    const unionMemberFunctions = [];
-    const unionTypes = baseType.getTypes();
-
-    for (const unionMemberType of unionTypes) {
-      // Check if we have a type selection for this union member
-      const unionMemberContextPath = `${fieldContextPath}.${unionMemberType.name}`;
-      const unionMemberSelection = allTypeSelections.find(
-        selection =>
-          selection.typeName === unionMemberType.name &&
-          selection.contextPath === unionMemberContextPath,
-      );
-
-      if (unionMemberSelection) {
-        // Adjust context path for single root field operations
-        let adjustedUnionMemberContextPath = unionMemberContextPath;
-        if (
-          hasSingleRoot &&
-          rootFieldName &&
-          adjustedUnionMemberContextPath.startsWith(rootFieldName)
-        ) {
-          adjustedUnionMemberContextPath =
-            adjustedUnionMemberContextPath === rootFieldName
-              ? ''
-              : adjustedUnionMemberContextPath.substring(rootFieldName.length + 1);
-        }
-
-        // Create the mock function name for this union member using the same naming as the actual generated functions
-        const contextSuffix = contextToCamelCase(adjustedUnionMemberContextPath);
-        const unionMemberFunctionName = contextSuffix
-          ? `fake_${operationName}_${contextSuffix}`
-          : `fake_${operationName}`;
-
-        unionMemberFunctions.push(unionMemberFunctionName);
-      }
-    }
-
-    if (unionMemberFunctions.length > 0) {
-      // For lists, create array with both union members
-      if (isFieldListType(fieldDef.type)) {
-        if (arrayIndex && arrayIndex !== "''" && arrayIndex !== '""' && arrayIndex !== "''") {
-          // For array contexts, include parent index to ensure uniqueness
-          const unionCalls = unionMemberFunctions
-            .map((fn, idx) => `${fn}(\`\${${arrayIndex}}_${idx}\`)`)
-            .join(', ');
-          return `    ${fieldName}: [${unionCalls}]`;
-        } else {
-          // For non-array contexts, use simple indices
-          const unionCalls = unionMemberFunctions.map((fn, idx) => `${fn}('${idx}')`).join(', ');
-          return `    ${fieldName}: [${unionCalls}]`;
-        }
-      } else {
-        // For single union values, pick the first one (or could be random)
-        const selectedFunction = unionMemberFunctions[0];
-        if (arrayIndex && arrayIndex !== "''" && arrayIndex !== '""' && arrayIndex !== "''") {
-          return `    ${fieldName}: ${selectedFunction}(\`\${${arrayIndex}}\`)`;
-        } else {
-          return `    ${fieldName}: ${selectedFunction}('')`;
-        }
-      }
-    }
-
-    // Fallback if no union member mock functions found
-    return `    ${fieldName}: null`;
-  }
-
-  // Handle scalar types (both built-in and custom)
-  // Check if this field is a list type for scalars
-  if (isFieldListType(fieldDef.type)) {
-    // Handle array of scalars
-    if (baseType.name === 'String' || baseType.name === 'ID') {
-      return `    ${fieldName}: ['${fieldName}_0', '${fieldName}_1']`;
-    } else if (baseType.name === 'Int') {
-      return `    ${fieldName}: [1, 2]`;
-    } else if (baseType.name === 'Float') {
-      return `    ${fieldName}: [1.0, 2.0]`;
-    } else if (baseType.name === 'Boolean') {
-      return `    ${fieldName}: [true, false]`;
-    } else if (scalarsMap && scalarsMap[baseType.name]) {
-      // Custom scalar arrays
-      const scalarConfig = scalarsMap[baseType.name];
-      const scalarType = (scalarConfig as any).output?.type || scalarConfig.type || 'any';
-      const customMockValue = getScalarMockValue(scalarType, fieldName);
-      return `    ${fieldName}: [${customMockValue}, ${customMockValue}]`;
-    } else {
-      // Fallback for unknown scalar arrays
-      return `    ${fieldName}: ['${fieldName}_0', '${fieldName}_1']`;
-    }
-  }
-
-  // Handle scalar types (both built-in and custom)
-  // Special handling for ID fields to create unique identifiers
-  if (baseType.name === 'ID' || fieldName === 'id') {
-    const contextPart = currentContextPath.replace(/\./g, '_');
-    if (arrayIndex && arrayIndex !== "''" && arrayIndex !== '""' && arrayIndex !== "''") {
-      // For array contexts, use template literal with dynamic index
-      return `    ${fieldName}: \`${contextPart}_${fieldName}_\${${arrayIndex}}\``;
-    } else {
-      // For non-array contexts, but still use the arrayIndex if available for unique IDs
-      return `    ${fieldName}: \`${contextPart}_${fieldName}\${arrayIndex ? \`_\${arrayIndex}\` : ''}\``;
-    }
-  }
-
-  // First check for custom scalars
-  if (scalarsMap && scalarsMap[baseType.name]) {
-    const scalarConfig = scalarsMap[baseType.name];
-    const scalarType = (scalarConfig as any).output?.type || scalarConfig.type || 'any';
-    const customMockValue = getScalarMockValue(scalarType, fieldName);
-    return `    ${fieldName}: ${customMockValue}`;
-  }
-
-  // Then handle built-in GraphQL scalars
-  const mockValue = getPrimitiveMockValue(baseType.name, fieldName);
-  return `    ${fieldName}: ${mockValue}`;
-}
+const buildFunctionName = (operationName: string, contextPath: string): string => {
+    const suffix = contextToCamelCase(contextPath);
+    return suffix ? `fake_${operationName}_${suffix}` : `fake_${operationName}`;
+};
 
 /**
- * Generates mock functions for GraphQL operations.
+ * Format a mock function call with proper array index handling.
+ * Consolidates the repeated pattern of generating function calls with/without array indices.
  *
- * PROCESS:
- * 1. Add necessary imports (schema types and/or generated query types)
- * 2. For each operation, find all selected types and fields
- * 3. Generate a mock function for each type with realistic mock data
- * 4. Handle nested objects by calling other mock functions
+ * @param functionName - The mock function name to call
+ * @param isArray - Whether this is an array field (generates two calls)
+ * @param arrayIndex - Optional array index variable name (e.g., 'i')
+ * @returns Formatted function call(s) as a string
+ *
+ * @example
+ * formatMockFunctionCall('fake_Messages', false, undefined) => 'fake_Messages()'
+ * formatMockFunctionCall('fake_Messages', false, 'i') => 'fake_Messages(undefined, `${i}`)'
+ * formatMockFunctionCall('fake_Messages', true, undefined) => '[fake_Messages(undefined, \'0\'), fake_Messages(undefined, \'1\')]'
+ * formatMockFunctionCall('fake_Messages', true, 'i') => '[fake_Messages(undefined, `${i}_0`), fake_Messages(undefined, `${i}_1`)]'
  */
-function generateOperationMocks(
-  schema: GraphQLSchema,
-  documents: Types.DocumentFile[],
-  typesFile?: string,
-  useGeneratedTypes?: boolean,
-  allFragments: LoadedFragment[] = [],
-  queryTypesFile?: string,
-  scalarsMap?: ParsedScalarsMap,
-  enumValuesMap?: ParsedEnumValuesMap,
-  enumsAsConst = false,
-): string {
-  const mockFunctions: string[] = [];
+const formatMockFunctionCall = (functionName: string, isArray: boolean, arrayIndex?: string): string => {
+    if (isArray) {
+        if (arrayIndex) {
+            return `[${functionName}(undefined, \`\${${arrayIndex}}_0\`), ${functionName}(undefined, \`\${${arrayIndex}}_1\`)]`;
+        }
+        return `[${functionName}(undefined, '0'), ${functionName}(undefined, '1')]`;
+    }
+    if (arrayIndex) {
+        return `${functionName}(undefined, \`\${${arrayIndex}}\`)`;
+    }
+    return `${functionName}()`;
+};
 
-  // Do not generate enum/scalar definitions in mocks - they should only be in query types
+class OperationMocksVisitor extends ClientSideBaseVisitor<OperationMocksPluginConfig, ClientSideBasePluginConfig> {
+    private readonly _allFragments: Map<string, LoadedFragment>;
+    private readonly _typePrefix: string;
+    private readonly _scalarMockValues: Record<string, string>;
 
-  // Import schema types when using custom types file (not preset)
-  if (typesFile) {
-    mockFunctions.push(`import * as Types from '${typesFile}';`, '');
-  }
+    constructor(
+        schema: GraphQLSchema,
+        fragments: LoadedFragment[],
+        rawConfig: OperationMocksPluginConfig,
+        documents: Types.DocumentFile[]
+    ) {
+        super(schema, fragments, rawConfig, {}, documents);
 
-  // Import generated query-specific types when enabled
-  if (useGeneratedTypes) {
-    const queryTypesPath = queryTypesFile || './_query-types';
-    mockFunctions.push(`import type * as QueryTypes from '${queryTypesPath}';`, '');
-  }
+        this._allFragments = new Map(fragments.map((f) => [f.name, f]));
+        this._typePrefix = rawConfig.typePrefix || 'Types.';
+        this._scalarMockValues = rawConfig.scalars || {};
+    }
 
-  documents
-    .filter(doc => doc.document)
-    .forEach(doc => {
-      const ast = doc.document!;
+    /**
+     * Generate mock functions for all operations in the document.
+     * Creates one function per type selection (including nested types).
+     *
+     * @returns Array of generated mock function code strings
+     *
+     * @example
+     * ```typescript
+     * // For query { vaksecties { id, naam, vakanties { naam } } }
+     * // Returns:
+     * // [
+     * //   'export const fake_Vaksecties = (overrides, length) => ...',
+     * //   'export const fake_Vaksecties_vakanties = (arrayIndex, overrides) => ...'
+     * // ]
+     * ```
+     */
+    generateMockFunctions(): string[] {
+        const operations = this.extractOperations();
 
-      ast.definitions
-        .filter(
-          (def): def is OperationDefinitionNode =>
-            def.kind === Kind.OPERATION_DEFINITION && !!def.name?.value,
-        )
-        .forEach(operation => {
-          const operationName = capitalize(operation.name!.value);
-          const typeSelections = findTypeSelections(schema, operation, allFragments);
+        if (operations.length === 0) {
+            return [];
+        }
 
-          // Check if operation has only one root field to adjust context paths
-          const { isSingle: hasSingleRoot, rootFieldName } = hasSingleRootField(operation);
-
-          // Create a mock function for each type and its selected fields
-          typeSelections.forEach(typeSelection => {
-            // Adjust context path for single root field operations
-            let adjustedContextPath = typeSelection.contextPath;
-            if (hasSingleRoot && rootFieldName && adjustedContextPath.startsWith(rootFieldName)) {
-              // Remove the root field from the context path for single root operations
-              adjustedContextPath =
-                adjustedContextPath === rootFieldName
-                  ? ''
-                  : adjustedContextPath.substring(rootFieldName.length + 1);
+        return operations.flatMap((operation) => {
+            try {
+                return this.createMockFunctionsForOperation(operation);
+            } catch (error) {
+                const operationName = operation.name?.value || 'unnamed';
+                throw new Error(
+                    `Failed to generate mock functions for operation "${operationName}": ${error instanceof Error ? error.message : String(error)}`
+                );
             }
+        });
+    }
 
-            // Create function name: fake_${queryname}_${contexts}
-            const contextSuffix = contextToCamelCase(adjustedContextPath);
-            const functionName = contextSuffix
-              ? `fake_${operationName}_${contextSuffix}`
-              : `fake_${operationName}`;
+    /**
+     * Extract all named operations from documents.
+     * Filters out fragment definitions and operations without names.
+     *
+     * @returns Array of GraphQL operation definition nodes (queries, mutations, subscriptions)
+     */
+    private extractOperations(): OperationDefinitionNode[] {
+        return this._documents
+            .flatMap((doc) => doc.document?.definitions || [])
+            .filter((def): def is OperationDefinitionNode => def.kind === Kind.OPERATION_DEFINITION)
+            .filter((op) => op.name?.value);
+    }
 
-            // Use generated interface name if useGeneratedTypes is true
-            const operationType = operation.operation;
-            const basePrefix = operationType.charAt(0).toUpperCase() + operationType.slice(1);
-            const interfaceName = useGeneratedTypes
-              ? `QueryTypes.${basePrefix}_${operationName}${contextToPascalCase(adjustedContextPath)}`
-              : typeSelection.typeName;
+    /**
+     * Create mock functions for an operation (one function per type selection).
+     *
+     * Analyzes the operation to find all type selections and generates a mock function
+     * for each one. Groups type selections by their base context to identify interface/union
+     * variants and adds JSDoc comments for variant functions.
+     *
+     * @param operation - The GraphQL operation to process
+     * @returns Array of mock function code strings
+     *
+     * @example
+     * ```typescript
+     * // For: query Messages { messages { id, author { name } } }
+     * // Returns array with 2 functions:
+     * // - fake_Messages(arrayIndex, overrides) for Message[]
+     * // - fake_Messages_author(arrayIndex, overrides) for Author
+     * ```
+     */
+    private createMockFunctionsForOperation(operation: OperationDefinitionNode): string[] {
+        const operationName = this.convertName(operation, {
+            useTypesPrefix: false,
+            useTypesSuffix: false
+        });
+        const typeSelections = this.findTypeSelections(operation);
+        const { isSingle: hasSingleRoot, rootFieldName } = this.hasSingleRootField(operation);
 
-            // Check if this is a root field that returns an array
-            let isRootArrayField = false;
-            if (hasSingleRoot && rootFieldName && adjustedContextPath === '') {
-              // This is the root field, check if it's a list type in the schema
-              const operationRootType = schema.getRootType(operation.operation);
-              if (operationRootType) {
-                const rootField = operationRootType.getFields()[rootFieldName];
-                if (rootField && isFieldListType(rootField.type)) {
-                  isRootArrayField = true;
-                }
-              }
+        // Group type selections by their base context path (without concrete type suffix)
+        // This helps us identify which selections are variants of the same interface/union field
+        const selectionsByBaseContext = new Map<string, TypeFieldSelection[]>();
+
+        typeSelections.forEach((selection) => {
+            // Extract base context path (remove concrete type suffix if present)
+            const parts = selection.contextPath.split('.');
+            const baseContextPath = selection.concreteTypeName ? parts.slice(0, -1).join('.') : selection.contextPath;
+
+            const existing = selectionsByBaseContext.get(baseContextPath);
+            if (existing) {
+                existing.push(selection);
+            } else {
+                selectionsByBaseContext.set(baseContextPath, [selection]);
             }
+        });
 
-            // Generate mock data for each selected field with appropriate types
-            const mockFields = Array.from(typeSelection.selectedFields)
-              .map(field =>
-                generateMockFieldValue(
-                  schema,
-                  typeSelection.typeName,
-                  field,
-                  operationName,
-                  typeSelections,
-                  typeSelection.contextPath,
-                  hasSingleRoot,
-                  rootFieldName,
-                  scalarsMap,
-                  enumValuesMap,
-                  isRootArrayField ? 'i' : undefined, // Pass array index variable for array contexts
-                ),
-              )
-              .filter(field => field.trim().length > 0) // Remove empty fields
-              .join(',\n');
+        return typeSelections.map((typeSelection) => {
+            // Find all variants for this type selection's base context
+            const parts = typeSelection.contextPath.split('.');
+            const baseContextPath = typeSelection.concreteTypeName ? parts.slice(0, -1).join('.') : typeSelection.contextPath;
+            const variants = selectionsByBaseContext.get(baseContextPath) || [];
 
-            // Generate appropriate mock function based on whether it's an array field
-            let mockFunction: string;
-            if (isRootArrayField) {
-              // Generate a function that returns an array of objects
-              mockFunction = `export const ${functionName} = (overrides?: Partial<${interfaceName}>[], length: number = 2): ${interfaceName}[] => {
+            return this.createMockFunctionForTypeSelection(
+                operation,
+                operationName,
+                typeSelection,
+                typeSelections,
+                hasSingleRoot,
+                rootFieldName,
+                variants
+            );
+        });
+    }
+
+    /**
+     * Create a single mock function for a type selection
+     */
+    private createMockFunctionForTypeSelection(
+        operation: OperationDefinitionNode,
+        operationName: string,
+        typeSelection: TypeFieldSelection,
+        allTypeSelections: TypeFieldSelection[],
+        hasSingleRoot: boolean,
+        rootFieldName: string | undefined,
+        variants: TypeFieldSelection[]
+    ): string {
+        const adjustedContextPath = this.adjustContextPath(typeSelection.contextPath, hasSingleRoot, rootFieldName);
+
+        const functionName = buildFunctionName(operationName, adjustedContextPath);
+
+        const operationType = operation.operation;
+        const basePrefix = operationType.charAt(0).toUpperCase() + operationType.slice(1);
+        const interfaceName = `${this._typePrefix}${basePrefix}_${operationName}${contextToPascalCase(adjustedContextPath)}`;
+
+        const isRootArrayField = this.checkIfRootArrayField(operation, hasSingleRoot, rootFieldName, adjustedContextPath);
+
+        const mockFields = this.generateMockFields(
+            typeSelection,
+            operationName,
+            allTypeSelections,
+            hasSingleRoot,
+            rootFieldName,
+            isRootArrayField
+        );
+
+        // Generate JSDoc if this is one of multiple variants for an interface/union field
+        let jsDoc = '';
+        if (variants.length > 1 && typeSelection.concreteTypeName) {
+            const otherVariants = variants
+                .filter((v) => v.concreteTypeName !== typeSelection.concreteTypeName)
+                .sort((a, b) => (a.inlineFragmentOrder || 0) - (b.inlineFragmentOrder || 0))
+                .map((v) => {
+                    const variantContextPath = this.adjustContextPath(v.contextPath, hasSingleRoot, rootFieldName);
+                    return buildFunctionName(operationName, variantContextPath);
+                });
+
+            if (otherVariants.length > 0) {
+                jsDoc = `/**\n * Mock function for ${typeSelection.concreteTypeName} variant.\n * This is one of ${variants.length} mock variants for this field.\n * See also: ${otherVariants.join(', ')}\n */\n`;
+            }
+        }
+
+        return this.createMockFunctionCode(functionName, interfaceName, mockFields, isRootArrayField, jsDoc);
+    }
+
+    /**
+     * Adjust context path for single root operations
+     */
+    private adjustContextPath(contextPath: string, hasSingleRoot: boolean, rootFieldName?: string): string {
+        if (!hasSingleRoot || !rootFieldName || !contextPath.startsWith(rootFieldName)) {
+            return contextPath;
+        }
+        return contextPath === rootFieldName ? '' : contextPath.substring(rootFieldName.length + 1);
+    }
+
+    /**
+     * Get the root type for an operation from the schema.
+     */
+    private getRootTypeForOperation(operation: OperationDefinitionNode) {
+        const rootTypes = {
+            query: this._schema.getQueryType(),
+            mutation: this._schema.getMutationType(),
+            subscription: this._schema.getSubscriptionType()
+        };
+        return rootTypes[operation.operation];
+    }
+
+    /**
+     * Check if root field is an array
+     */
+    private checkIfRootArrayField(
+        operation: OperationDefinitionNode,
+        hasSingleRoot: boolean,
+        rootFieldName: string | undefined,
+        adjustedContextPath: string
+    ): boolean {
+        if (!hasSingleRoot || !rootFieldName || adjustedContextPath !== '') return false;
+
+        const operationRootType = this._schema.getRootType(operation.operation);
+        if (!operationRootType) return false;
+
+        const rootField = operationRootType.getFields()[rootFieldName];
+        return rootField ? isFieldListType(rootField.type) : false;
+    }
+
+    /**
+     * Generate mock fields for a type selection
+     */
+    private generateMockFields(
+        typeSelection: TypeFieldSelection,
+        operationName: string,
+        allTypeSelections: TypeFieldSelection[],
+        hasSingleRoot: boolean,
+        rootFieldName: string | undefined,
+        isRootArrayField: boolean
+    ): string {
+        // Always include __typename first
+        const typenameField = `    __typename: '${typeSelection.typeName}'`;
+
+        // Generate fields for all selected fields (excluding __typename if it's in the set)
+        const selectedFields = Array.from(typeSelection.selectedFields)
+            .filter((field) => field !== '__typename')
+            .map((field) =>
+                this.generateMockFieldValue(
+                    typeSelection.typeName,
+                    field,
+                    operationName,
+                    allTypeSelections,
+                    typeSelection.contextPath,
+                    hasSingleRoot,
+                    rootFieldName,
+                    isRootArrayField ? 'i' : undefined
+                )
+            )
+            .filter((field) => field.trim().length > 0);
+
+        return [typenameField, ...selectedFields].join(',\n');
+    }
+
+    /**
+     * Generate mock value for a single field based on its GraphQL type.
+     *
+     * Handles different field types appropriately:
+     * - Object types: Reference to another mock function
+     * - Scalar types: Primitive values or custom scalar mock values
+     * - Enum types: First enum value from schema
+     * - Union types: Array of mock functions for each union member
+     * - List types: Arrays with 2 items by default
+     *
+     * @param typeName - The parent GraphQL type name
+     * @param fieldName - Name of the field to generate mock value for
+     * @param operationName - Name of the current operation
+     * @param allTypeSelections - All type selections in the operation (for finding nested types)
+     * @param currentContextPath - Current path from operation root
+     * @param hasSingleRoot - Whether operation has single root field
+     * @param rootFieldName - Name of root field if hasSingleRoot is true
+     * @param arrayIndex - Optional array index variable for nested array items
+     * @returns TypeScript code string for the mock field value
+     */
+    private generateMockFieldValue(
+        typeName: string,
+        fieldName: string,
+        operationName: string,
+        allTypeSelections: TypeFieldSelection[],
+        currentContextPath: string,
+        hasSingleRoot: boolean,
+        rootFieldName?: string,
+        arrayIndex?: string
+    ): string {
+        // Validate schema type
+        const schemaType = this._schema.getType(typeName);
+        if (!schemaType || !isObjectType(schemaType)) {
+            return `    ${fieldName}: '${fieldName}'`;
+        }
+
+        // Handle __typename special case
+        if (fieldName === '__typename') {
+            return `    ${fieldName}: '${typeName}'`;
+        }
+
+        // Get field definition
+        const fieldDef = schemaType.getFields()[fieldName];
+        if (!fieldDef) {
+            return `    ${fieldName}: '${fieldName}'`;
+        }
+
+        // Get base type info
+        const baseType = getBaseType(fieldDef.type);
+        if (!baseType?.name) {
+            return `    ${fieldName}: '${fieldName}'`;
+        }
+
+        // Compute field context path once (used by multiple handlers)
+        const fieldContextPath = currentContextPath ? `${currentContextPath}.${fieldName}` : fieldName;
+        const isListField = isFieldListType(fieldDef.type);
+
+        // Find referenced type selection for object/interface types
+        const referencedTypeSelection = this.findReferencedTypeSelection(baseType, fieldContextPath, allTypeSelections);
+
+        // Dispatch to appropriate type handler
+        if (referencedTypeSelection && (isObjectType(baseType) || isInterfaceType(baseType))) {
+            return this.generateObjectFieldMock(
+                fieldName,
+                operationName,
+                referencedTypeSelection,
+                isListField,
+                hasSingleRoot,
+                rootFieldName,
+                arrayIndex
+            );
+        }
+
+        if (isEnumType(baseType)) {
+            return this.generateEnumFieldMock(fieldName, baseType, isListField);
+        }
+
+        if (isUnionType(baseType)) {
+            return this.generateUnionFieldMock(
+                fieldName,
+                baseType,
+                fieldContextPath,
+                operationName,
+                allTypeSelections,
+                isListField,
+                hasSingleRoot,
+                rootFieldName,
+                arrayIndex
+            );
+        }
+
+        if (isListField) {
+            return this.generateScalarListFieldMock(fieldName, baseType.name);
+        }
+
+        if (baseType.name === 'ID' || fieldName === 'id') {
+            return this.generateIdFieldMock(fieldName, currentContextPath, arrayIndex);
+        }
+
+        return this.generateScalarFieldMock(fieldName, baseType.name);
+    }
+
+    /**
+     * Find the referenced type selection for a field, handling interface/union variants.
+     */
+    private findReferencedTypeSelection(
+        baseType: any,
+        fieldContextPath: string,
+        allTypeSelections: TypeFieldSelection[]
+    ): TypeFieldSelection | undefined {
+        const referencedTypeName = baseType.name;
+
+        // Check for exact match first
+        let selection = allTypeSelections.find((s) => s.typeName === referencedTypeName && s.contextPath === fieldContextPath);
+
+        // If no exact match, check for interface/union variants
+        if (!selection && (isInterfaceType(baseType) || isUnionType(baseType))) {
+            const variants = allTypeSelections
+                .filter((s) => s.contextPath.startsWith(`${fieldContextPath}.`))
+                .sort((a, b) => (a.inlineFragmentOrder || 0) - (b.inlineFragmentOrder || 0));
+
+            if (variants.length > 0) {
+                selection = variants[0];
+            }
+        }
+
+        return selection;
+    }
+
+    /**
+     * Generate mock value for object/interface type fields.
+     */
+    private generateObjectFieldMock(
+        fieldName: string,
+        operationName: string,
+        referencedTypeSelection: TypeFieldSelection,
+        isListField: boolean,
+        hasSingleRoot: boolean,
+        rootFieldName?: string,
+        arrayIndex?: string
+    ): string {
+        const adjustedContextPath = this.adjustContextPath(referencedTypeSelection.contextPath, hasSingleRoot, rootFieldName);
+        const functionName = buildFunctionName(operationName, adjustedContextPath);
+        const call = formatMockFunctionCall(functionName, isListField, arrayIndex);
+        return `    ${fieldName}: ${call}`;
+    }
+
+    /**
+     * Generate mock value for enum type fields.
+     */
+    private generateEnumFieldMock(fieldName: string, baseType: any, isListField: boolean): string {
+        const enumValues = baseType.getValues();
+        if (enumValues.length === 0) {
+            return `    ${fieldName}: null`;
+        }
+
+        const enumTypeName = this.convertName(baseType.name, {
+            useTypesPrefix: false,
+            useTypesSuffix: false
+        });
+        const enumValueName = enumValues[0].name;
+        const enumReference = `Types.${enumTypeName}.${enumValueName}`;
+
+        if (isListField) {
+            return `    ${fieldName}: [${enumReference}, ${enumReference}]`;
+        }
+        return `    ${fieldName}: ${enumReference}`;
+    }
+
+    /**
+     * Generate mock value for union type fields.
+     */
+    private generateUnionFieldMock(
+        fieldName: string,
+        baseType: any,
+        fieldContextPath: string,
+        operationName: string,
+        allTypeSelections: TypeFieldSelection[],
+        isListField: boolean,
+        hasSingleRoot: boolean,
+        rootFieldName?: string,
+        arrayIndex?: string
+    ): string {
+        const unionTypes = baseType.getTypes();
+        const unionMemberFunctions: string[] = [];
+
+        for (const unionMemberType of unionTypes) {
+            const unionMemberContextPath = `${fieldContextPath}.${unionMemberType.name}`;
+            const unionMemberSelection = allTypeSelections.find(
+                (s) => s.typeName === unionMemberType.name && s.contextPath === unionMemberContextPath
+            );
+
+            if (unionMemberSelection) {
+                const adjustedPath = this.adjustContextPath(unionMemberContextPath, hasSingleRoot, rootFieldName);
+                unionMemberFunctions.push(buildFunctionName(operationName, adjustedPath));
+            }
+        }
+
+        if (unionMemberFunctions.length === 0) {
+            return `    ${fieldName}: null`;
+        }
+
+        if (isListField) {
+            const calls = unionMemberFunctions.map((fn, idx) =>
+                arrayIndex ? `${fn}(undefined, \`\${${arrayIndex}}_${idx}\`)` : `${fn}(undefined, '${idx}')`
+            );
+            return `    ${fieldName}: [${calls.join(', ')}]`;
+        }
+
+        const call = formatMockFunctionCall(unionMemberFunctions[0], false, arrayIndex);
+        return `    ${fieldName}: ${call}`;
+    }
+
+    /**
+     * Generate mock value for scalar list fields.
+     */
+    private generateScalarListFieldMock(fieldName: string, typeName: string): string {
+        const scalarListMock = SCALAR_LIST_MOCKS[typeName];
+        if (scalarListMock) {
+            return `    ${fieldName}: ${scalarListMock(fieldName)}`;
+        }
+
+        if (this._scalarMockValues[typeName]) {
+            const customMockValue = getScalarMockValue(this._scalarMockValues[typeName], fieldName);
+            return `    ${fieldName}: [${customMockValue}, ${customMockValue}]`;
+        }
+
+        return `    ${fieldName}: ['${fieldName}_0', '${fieldName}_1']`;
+    }
+
+    /**
+     * Generate mock value for ID fields with unique identifiers.
+     */
+    private generateIdFieldMock(fieldName: string, currentContextPath: string, arrayIndex?: string): string {
+        const contextPart = currentContextPath.replace(/\./g, '_');
+        if (arrayIndex) {
+            return `    ${fieldName}: \`${contextPart}_${fieldName}_\${${arrayIndex}}\``;
+        }
+        return `    ${fieldName}: \`${contextPart}_${fieldName}\${arrayIndex ? \`_\${arrayIndex}\` : ''}\``;
+    }
+
+    /**
+     * Generate mock value for scalar fields (non-list, non-ID).
+     */
+    private generateScalarFieldMock(fieldName: string, typeName: string): string {
+        // Check for custom scalars (skip built-in types)
+        if (this._scalarMockValues[typeName] && !BUILT_IN_GRAPHQL_TYPES.includes(typeName as any)) {
+            const customMockValue = getScalarMockValue(this._scalarMockValues[typeName], fieldName);
+            return `    ${fieldName}: ${customMockValue}`;
+        }
+
+        // Default scalar values (handles all built-in types)
+        const mockValue = getPrimitiveMockValue(typeName, fieldName);
+        return `    ${fieldName}: ${mockValue}`;
+    }
+
+    /**
+     * Create the mock function code
+     */
+    private createMockFunctionCode(
+        functionName: string,
+        interfaceName: string,
+        mockFields: string,
+        isRootArrayField: boolean,
+        jsDoc = ''
+    ): string {
+        if (isRootArrayField) {
+            return `${jsDoc}export const ${functionName} = (overrides?: Partial<${interfaceName}>[], length: number = 2): ${interfaceName}[] => {
   return Array.from({ length }, (_, i) => ({
 ${mockFields ? mockFields + ',' : ''}
     ...(overrides?.[i] || {}),
   }));
 };`;
-            } else {
-              // All non-array functions accept optional arrayIndex for unique ID generation
-              mockFunction = `export const ${functionName} = (arrayIndex: string = '', overrides?: Partial<${interfaceName}>): ${interfaceName} => {
+        } else {
+            return `${jsDoc}export const ${functionName} = (overrides?: Partial<${interfaceName}>, arrayIndex = ''): ${interfaceName} => {
   return {
 ${mockFields ? mockFields + ',' : ''}
     ...overrides,
   };
 };`;
-            }
-
-            mockFunctions.push(mockFunction);
-          });
-        });
-    });
-
-  return mockFunctions.join('\n');
-}
-
-/**
- * Generates TypeScript interfaces for operation-specific field selections.
- *
- * PURPOSE:
- * Instead of using full schema types, create interfaces with only the fields
- * that are actually selected in your GraphQL operations.
- *
- * EXAMPLE:
- * Query: { user { id, name, profile { bio } } }
- * Generates: GetUser_User { id: string; name: string; profile: GetUser_Profile; }
- *            GetUser_Profile { bio: string; }
- *
- * PROCESS:
- * 1. First pass: Collect all type selections across all operations
- * 2. Second pass: Generate interfaces with proper cross-references
- */
-function generateQueryTypes_impl(
-  schema: GraphQLSchema,
-  documents: Types.DocumentFile[],
-  allFragments: LoadedFragment[] = [],
-  scalarsMap?: ParsedScalarsMap,
-  enumValuesMap?: ParsedEnumValuesMap,
-  enumsAsConst = false,
-): string {
-  const typeInterfaces: string[] = [];
-  const generatedTypes = new Set<string>(); // Track generated interfaces to avoid duplicates
-
-  // Generate enum definitions first if we have enums
-  if (enumValuesMap) {
-    const enumDefinitions = generateEnumDefinitions(schema, enumValuesMap, enumsAsConst);
-    if (enumDefinitions) {
-      typeInterfaces.push(enumDefinitions, '');
-    }
-  }
-
-  // Generate scalar definitions if we have scalars
-  if (scalarsMap) {
-    const scalarDefinitions = generateScalarDefinitions(scalarsMap);
-    if (scalarDefinitions) {
-      typeInterfaces.push(scalarDefinitions, '');
-    }
-  }
-
-  // FIRST PASS: Map all operation types to their selected fields
-  const allTypeSelections = new Map<string, Set<string>>();
-
-  documents
-    .filter(doc => doc.document)
-    .forEach(doc => {
-      const ast = doc.document!;
-
-      ast.definitions
-        .filter(
-          (def): def is OperationDefinitionNode =>
-            def.kind === Kind.OPERATION_DEFINITION && !!def.name?.value,
-        )
-        .forEach(operation => {
-          const operationName = capitalize(operation.name!.value);
-          const typeSelections = findTypeSelections(schema, operation, allFragments);
-
-          // Check if operation has only one root field to adjust context paths
-          const { isSingle: hasSingleRoot, rootFieldName } = hasSingleRootField(operation);
-
-          typeSelections.forEach(typeSelection => {
-            // Adjust context path for single root field operations
-            let adjustedContextPath = typeSelection.contextPath;
-            if (hasSingleRoot && rootFieldName && adjustedContextPath.startsWith(rootFieldName)) {
-              // Remove the root field from the context path for single root operations
-              adjustedContextPath =
-                adjustedContextPath === rootFieldName
-                  ? ''
-                  : adjustedContextPath.substring(rootFieldName.length + 1);
-            }
-
-            // Create interface name: ${base}_${queryname}_${context}
-            const operationType = operation.operation; // 'query', 'mutation', 'subscription'
-            const basePrefix = operationType.charAt(0).toUpperCase() + operationType.slice(1); // 'Query', 'Mutation', 'Subscription'
-
-            const interfaceName = `${basePrefix}_${operationName}${contextToPascalCase(adjustedContextPath)}`;
-
-            allTypeSelections.set(interfaceName, typeSelection.selectedFields);
-          });
-        });
-    });
-
-  // Second pass: generate interfaces with proper type references
-  documents
-    .filter(doc => doc.document)
-    .forEach(doc => {
-      const ast = doc.document!;
-
-      ast.definitions
-        .filter(
-          (def): def is OperationDefinitionNode =>
-            def.kind === Kind.OPERATION_DEFINITION && !!def.name?.value,
-        )
-        .forEach(operation => {
-          const operationName = capitalize(operation.name!.value);
-          const typeSelections = findTypeSelections(schema, operation, allFragments);
-
-          // Check if operation has only one root field to adjust context paths
-          const { isSingle: hasSingleRoot, rootFieldName } = hasSingleRootField(operation);
-
-          // Create TypeScript interfaces for each type with selected fields
-          typeSelections.forEach(typeSelection => {
-            // Adjust context path for single root field operations
-            let adjustedContextPath = typeSelection.contextPath;
-            if (hasSingleRoot && rootFieldName && adjustedContextPath.startsWith(rootFieldName)) {
-              // Remove the root field from the context path for single root operations
-              adjustedContextPath =
-                adjustedContextPath === rootFieldName
-                  ? ''
-                  : adjustedContextPath.substring(rootFieldName.length + 1);
-            }
-
-            // Create interface name: ${base}_${queryname}_${context}
-            const operationType = operation.operation; // 'query', 'mutation', 'subscription'
-            const basePrefix = operationType.charAt(0).toUpperCase() + operationType.slice(1); // 'Query', 'Mutation', 'Subscription'
-
-            const interfaceName = `${basePrefix}_${operationName}${contextToPascalCase(adjustedContextPath)}`;
-
-            if (!generatedTypes.has(interfaceName)) {
-              generatedTypes.add(interfaceName);
-
-              // Generate interface with only selected fields
-              const interfaceFields = Array.from(typeSelection.selectedFields)
-                .map(field => {
-                  // Handle special __typename field first
-                  if (field === '__typename') {
-                    return `  ${field}: '${typeSelection.typeName}';`;
-                  }
-
-                  // Get the field type from the schema
-                  const schemaType = schema.getType(typeSelection.typeName);
-                  if (schemaType && isObjectType(schemaType)) {
-                    const fieldDef = schemaType.getFields()[field];
-                    if (fieldDef) {
-                      const baseType = getBaseType(fieldDef.type);
-                      const isNullable = !isNonNullType(fieldDef.type); // Check if field is nullable
-
-                      let fieldType = 'string'; // default fallback
-
-                      // Handle scalar types
-                      if (scalarsMap && scalarsMap[baseType.name]) {
-                        // Check if it's a custom scalar (not a built-in GraphQL scalar)
-                        if (['String', 'Int', 'Float', 'Boolean', 'ID'].includes(baseType.name)) {
-                          // Use simple type for built-in scalars
-                          if (baseType.name === 'String' || baseType.name === 'ID')
-                            fieldType = 'string';
-                          else if (baseType.name === 'Int' || baseType.name === 'Float')
-                            fieldType = 'number';
-                          else if (baseType.name === 'Boolean') fieldType = 'boolean';
-                        } else {
-                          // Use Scalars reference for custom scalars
-                          fieldType = `Scalars['${baseType.name}']['output']`;
-                        }
-                      } else if (baseType.name === 'String') fieldType = 'string';
-                      else if (baseType.name === 'Int' || baseType.name === 'Float')
-                        fieldType = 'number';
-                      else if (baseType.name === 'Boolean') fieldType = 'boolean';
-                      else if (baseType.name === 'ID') fieldType = 'string';
-                      else if (isEnumType(baseType)) {
-                        // Handle enum types
-                        fieldType = baseType.name;
-                      } else if (isUnionType(baseType)) {
-                        // Handle union types - find all generated union member interfaces
-                        const fieldContextPath = typeSelection.contextPath
-                          ? `${typeSelection.contextPath}.${field}`
-                          : field;
-
-                        // Adjust context path for single root field operations
-                        let adjustedFieldContextPath = fieldContextPath;
-                        if (
-                          hasSingleRoot &&
-                          rootFieldName &&
-                          adjustedFieldContextPath.startsWith(rootFieldName)
-                        ) {
-                          adjustedFieldContextPath =
-                            adjustedFieldContextPath === rootFieldName
-                              ? ''
-                              : adjustedFieldContextPath.substring(rootFieldName.length + 1);
-                        }
-
-                        // Look for all union member interfaces for this field
-                        const unionMemberTypes = [];
-                        const unionTypes = baseType.getTypes();
-
-                        for (const unionMemberType of unionTypes) {
-                          // Build the union member context path: field.MemberType
-                          const unionMemberContextPath = adjustedFieldContextPath
-                            ? `${adjustedFieldContextPath}.${unionMemberType.name}`
-                            : unionMemberType.name;
-                          const unionMemberInterfaceName = `${basePrefix}_${operationName}${contextToPascalCase(unionMemberContextPath)}`;
-                          if (allTypeSelections.has(unionMemberInterfaceName)) {
-                            unionMemberTypes.push(unionMemberInterfaceName);
-                          }
-                        }
-
-                        if (unionMemberTypes.length > 0) {
-                          fieldType = unionMemberTypes.join(' | ');
-                        } else {
-                          fieldType = baseType.name; // Use the schema type name as fallback
-                        }
-                      } else {
-                        // Check if this is an object type that we're generating an interface for
-                        // Build the referenced interface name with proper context
-                        const fieldContextPath = typeSelection.contextPath
-                          ? `${typeSelection.contextPath}.${field}`
-                          : field;
-
-                        // Adjust context path for single root field operations
-                        let adjustedFieldContextPath = fieldContextPath;
-                        if (
-                          hasSingleRoot &&
-                          rootFieldName &&
-                          adjustedFieldContextPath.startsWith(rootFieldName)
-                        ) {
-                          adjustedFieldContextPath =
-                            adjustedFieldContextPath === rootFieldName
-                              ? ''
-                              : adjustedFieldContextPath.substring(rootFieldName.length + 1);
-                        }
-
-                        const referencedInterfaceName = `${basePrefix}_${operationName}${contextToPascalCase(adjustedFieldContextPath)}`;
-
-                        if (allTypeSelections.has(referencedInterfaceName)) {
-                          fieldType = referencedInterfaceName;
-                        } else {
-                          fieldType = baseType.name; // Use the schema type name as fallback
-                        }
-                      }
-
-                      // Handle list types (arrays)
-                      const isListField = isFieldListType(fieldDef.type);
-                      if (isListField) {
-                        fieldType = `${fieldType}[]`;
-                      }
-
-                      // Add null union type for nullable fields
-                      if (isNullable) {
-                        fieldType = `${fieldType} | null`;
-                      }
-
-                      return `  ${field}: ${fieldType};`;
-                    }
-                  }
-                  return `  ${field}: any;`; // fallback
-                })
-                .join('\n');
-
-              const interfaceDeclaration = `export interface ${interfaceName} {
-${interfaceFields}
-}`;
-
-              typeInterfaces.push(interfaceDeclaration);
-            }
-          });
-        });
-    });
-
-  return typeInterfaces.join('\n\n');
-}
-
-/**
- * Check if an operation has only one root field selection
- */
-function hasSingleRootField(operation: OperationDefinitionNode): {
-  isSingle: boolean;
-  rootFieldName?: string;
-} {
-  const rootSelections = operation.selectionSet.selections.filter(
-    selection => selection.kind === Kind.FIELD,
-  );
-
-  if (rootSelections.length === 1) {
-    const rootField = rootSelections[0] as FieldNode;
-    return { isSingle: true, rootFieldName: rootField.name.value };
-  }
-
-  return { isSingle: false };
-}
-
-/**
- * Analyzes a GraphQL operation to find all selected types and their fields.
- *
- * WHAT IT DOES:
- * - Traverses the operation's selection set (query/mutation/subscription)
- * - Identifies which GraphQL object types are referenced
- * - Tracks which specific fields are selected for each type
- * - Uses iterative approach (no recursion) for better performance
- *
- * EXAMPLE INPUT: query GetUser { user { id, profile { bio } } }
- * EXAMPLE OUTPUT: [
- *   { typeName: 'User', selectedFields: Set(['id', 'profile']) },
- *   { typeName: 'Profile', selectedFields: Set(['bio']) }
- * ]
- */
-function findTypeSelections(
-  schema: GraphQLSchema,
-  operation: OperationDefinitionNode,
-  allFragments: LoadedFragment[] = [],
-): TypeFieldSelection[] {
-  const typeSelections = new Map<string, TypeFieldSelection>(); // Map by contextPath
-
-  // Determine the root type based on operation kind
-  const rootType = {
-    query: schema.getQueryType(),
-    mutation: schema.getMutationType(),
-    subscription: schema.getSubscriptionType(),
-  }[operation.operation];
-
-  if (rootType) {
-    // Process the operation using iterative traversal (more efficient than recursion)
-    collectTypeSelectionsIteratively(
-      operation.selectionSet.selections,
-      typeSelections,
-      rootType,
-      '',
-      allFragments,
-      schema,
-    );
-  }
-
-  // Convert Map to TypeFieldSelection array
-  return Array.from(typeSelections.values());
-}
-
-/**
- * Iteratively traverses GraphQL selections to collect type information.
- *
- * ALGORITHM:
- * - Uses breadth-first traversal with a processing queue
- * - Each level processes all current selections
- * - Collects nested selections for the next level
- * - Continues until no more nested selections exist
- *
- * WHY ITERATIVE:
- * - Avoids stack overflow on deeply nested queries
- * - Better performance than recursive approach
- * - Easier to debug and understand flow
- */
-function collectTypeSelectionsIteratively(
-  initialSelections: readonly any[],
-  typeSelections: Map<string, TypeFieldSelection>,
-  initialParentType: any,
-  initialContextPath: string = '',
-  allFragments: LoadedFragment[] = [],
-  schema: GraphQLSchema,
-) {
-  // Queue of selections to process: [{ selections, parentType, contextPath }]
-  let processingQueue = [
-    {
-      selections: initialSelections,
-      parentType: initialParentType,
-      contextPath: initialContextPath,
-    },
-  ];
-
-  // Process queue until empty (breadth-first traversal)
-  while (processingQueue.length > 0) {
-    // Process current level and build next level queue
-    processingQueue = processingQueue.flatMap(({ selections, parentType, contextPath }) => {
-      const nextLevelItems: any[] = [];
-
-      for (const selection of selections) {
-        if (selection.kind === Kind.FIELD) {
-          // Handle field selections
-          const field = selection as FieldNode;
-          if (isObjectType(parentType) && parentType.getFields()[field.name.value]) {
-            const fieldDef = parentType.getFields()[field.name.value];
-            const fieldType = getBaseType(fieldDef.type); // Unwrap NonNull/List wrappers
-
-            // Track object types and their selected fields
-            if (isObjectType(fieldType)) {
-              const typeName = fieldType.name;
-              const newContextPath = contextPath
-                ? `${contextPath}.${field.name.value}`
-                : field.name.value;
-              const contextKey = `${typeName}@${newContextPath}`;
-
-              // Initialize type selection for this context
-              if (!typeSelections.has(contextKey)) {
-                typeSelections.set(contextKey, {
-                  typeName,
-                  contextPath: newContextPath,
-                  selectedFields: new Set(),
-                });
-              }
-
-              // Process nested selections if they exist
-              if (field.selectionSet) {
-                // Record all selected fields for this type in this context
-                field.selectionSet.selections
-                  .filter(nestedSelection => nestedSelection.kind === Kind.FIELD)
-                  .forEach(nestedSelection => {
-                    const nestedField = nestedSelection as FieldNode;
-                    typeSelections.get(contextKey)!.selectedFields.add(nestedField.name.value);
-                  });
-
-                // Also expand fragment spreads within field selection sets
-                field.selectionSet.selections
-                  .filter(nestedSelection => nestedSelection.kind === Kind.FRAGMENT_SPREAD)
-                  .forEach(nestedSelection => {
-                    const fragmentSpread = nestedSelection as FragmentSpreadNode;
-                    const fragmentName = fragmentSpread.name.value;
-                    const fragmentDef = allFragments.find(frag => frag.name === fragmentName);
-
-                    if (fragmentDef && fragmentDef.onType === fieldType.name) {
-                      // Add all fields from the fragment to the current type
-                      fragmentDef.node.selectionSet.selections
-                        .filter(fragSelection => fragSelection.kind === Kind.FIELD)
-                        .forEach(fragSelection => {
-                          const fragField = fragSelection as FieldNode;
-                          typeSelections.get(contextKey)!.selectedFields.add(fragField.name.value);
-                        });
-                    }
-                  });
-
-                // Queue nested selections for next iteration
-                nextLevelItems.push({
-                  selections: field.selectionSet.selections,
-                  parentType: fieldType,
-                  contextPath: newContextPath,
-                });
-              }
-            } else if (isUnionType(fieldType)) {
-              // Handle union type fields - process selections with union type as parent
-              if (field.selectionSet) {
-                const newContextPath = contextPath
-                  ? `${contextPath}.${field.name.value}`
-                  : field.name.value;
-
-                // Queue selections for processing with union type as parent
-                nextLevelItems.push({
-                  selections: field.selectionSet.selections,
-                  parentType: fieldType,
-                  contextPath: newContextPath,
-                });
-              }
-            }
-          }
-        } else if (selection.kind === Kind.FRAGMENT_SPREAD) {
-          // Handle fragment spread selections
-          const fragmentSpread = selection as FragmentSpreadNode;
-          const fragmentName = fragmentSpread.name.value;
-
-          // Find the fragment definition
-          const fragmentDef = allFragments.find(frag => frag.name === fragmentName);
-          if (
-            fragmentDef &&
-            (fragmentDef.onType === parentType.name ||
-              (isUnionType(parentType) &&
-                parentType.getTypes().some(t => t.name === fragmentDef.onType)))
-          ) {
-            // Add fragment selections to the current processing queue
-            nextLevelItems.push({
-              selections: fragmentDef.node.selectionSet.selections,
-              parentType,
-              contextPath,
-            });
-          }
-        } else if (selection.kind === Kind.INLINE_FRAGMENT) {
-          // Handle inline fragment selections (for union types)
-          const inlineFragment = selection as InlineFragmentNode;
-          if (inlineFragment.typeCondition) {
-            const fragmentTypeName = inlineFragment.typeCondition.name.value;
-            const fragmentType = schema.getType(fragmentTypeName);
-
-            if (fragmentType && isObjectType(fragmentType)) {
-              // Create a type selection for this union member
-              // Context path should include the union member type name
-              const unionMemberContextPath = contextPath
-                ? `${contextPath}.${fragmentTypeName}`
-                : fragmentTypeName;
-              const contextKey = `${fragmentTypeName}@${unionMemberContextPath}`;
-
-              // Initialize type selection for this union member
-              if (!typeSelections.has(contextKey)) {
-                typeSelections.set(contextKey, {
-                  typeName: fragmentTypeName,
-                  contextPath: unionMemberContextPath,
-                  selectedFields: new Set(),
-                });
-              }
-
-              // Record fields selected in this inline fragment
-              inlineFragment.selectionSet.selections
-                .filter(fragSelection => fragSelection.kind === Kind.FIELD)
-                .forEach(fragSelection => {
-                  const fragField = fragSelection as FieldNode;
-                  typeSelections.get(contextKey)!.selectedFields.add(fragField.name.value);
-                });
-
-              // Queue nested selections for processing
-              nextLevelItems.push({
-                selections: inlineFragment.selectionSet.selections,
-                parentType: fragmentType,
-                contextPath: unionMemberContextPath,
-              });
-            }
-          }
         }
-      }
+    }
 
-      return nextLevelItems;
-    });
-  }
+    /**
+     * Check if operation has single root field
+     */
+    private hasSingleRootField(operation: OperationDefinitionNode): {
+        isSingle: boolean;
+        rootFieldName?: string;
+    } {
+        const rootSelections = operation.selectionSet.selections.filter((selection) => selection.kind === Kind.FIELD);
 
-  // Convert Map to TypeFieldSelection array
-  return Array.from(typeSelections.values());
+        if (rootSelections.length === 1) {
+            const rootField = rootSelections[0] as any;
+            return { isSingle: true, rootFieldName: rootField.name.value };
+        }
+
+        return { isSingle: false };
+    }
+
+    /**
+     * Find all type selections in an operation by traversing its selection set.
+     *
+     * @param operation - The GraphQL operation to analyze
+     * @returns Array of type selections representing all types queried in the operation
+     * @throws Error if the operation type is not supported by the schema
+     */
+    private findTypeSelections(operation: OperationDefinitionNode): TypeFieldSelection[] {
+        const typeSelections = new Map<string, TypeFieldSelection>();
+
+        const rootType = this.getRootTypeForOperation(operation);
+
+        if (!rootType) {
+            const operationName = operation.name?.value || 'unnamed';
+            throw new Error(
+                `Schema does not support ${operation.operation} operations (operation: "${operationName}"). ` +
+                    `Ensure your GraphQL schema defines a ${operation.operation} type.`
+            );
+        }
+
+        try {
+            this.collectTypeSelectionsIteratively(operation.selectionSet.selections, typeSelections, rootType, '');
+        } catch (error) {
+            const operationName = operation.name?.value || 'unnamed';
+            throw new Error(
+                `Failed to analyze type selections for operation "${operationName}": ${error instanceof Error ? error.message : String(error)}`
+            );
+        }
+
+        return Array.from(typeSelections.values());
+    }
+
+    /**
+     * Recursively expand fragment spreads and collect fields.
+     * Handles nested fragments and inline fragments within fragments.
+     *
+     * @param fragmentName - Name of the fragment to expand
+     * @param selectedFields - Set to collect field names into
+     * @param visitedFragments - Set to track visited fragments (prevents infinite loops)
+     * @param targetTypeName - Optional type name to filter inline fragment fields
+     * @throws Error if a referenced fragment is not found
+     */
+    private expandFragmentFields(
+        fragmentName: string,
+        selectedFields: Set<string>,
+        visitedFragments: Set<string> = new Set(),
+        targetTypeName?: string
+    ): void {
+        // Prevent infinite loops from circular fragment references
+        if (visitedFragments.has(fragmentName)) {
+            return;
+        }
+
+        visitedFragments.add(fragmentName);
+
+        const fragment = this._allFragments.get(fragmentName);
+        if (!fragment) {
+            throw new Error(
+                `Fragment "${fragmentName}" is referenced but not found. ` +
+                    `Available fragments: ${Array.from(this._allFragments.keys()).join(', ') || 'none'}. ` +
+                    `Ensure all fragments are included in the documents or externalFragments configuration.`
+            );
+        }
+
+        if (!fragment.node?.selectionSet) {
+            return;
+        }
+
+        for (const selection of fragment.node.selectionSet.selections) {
+            if (selection.kind === Kind.FIELD) {
+                selectedFields.add(selection.name.value);
+            } else if (selection.kind === Kind.FRAGMENT_SPREAD) {
+                // Recursively expand nested fragment spreads
+                this.expandFragmentFields(selection.name.value, selectedFields, visitedFragments, targetTypeName);
+            } else if (selection.kind === Kind.INLINE_FRAGMENT && selection.selectionSet) {
+                // Handle inline fragments within fragments
+                // Only add fields if the inline fragment's type matches the target type (or if no type condition)
+                const inlineFragmentTypeName = selection.typeCondition?.name.value;
+
+                if (!inlineFragmentTypeName || !targetTypeName || inlineFragmentTypeName === targetTypeName) {
+                    for (const inlineSelection of selection.selectionSet.selections) {
+                        if (inlineSelection.kind === Kind.FIELD) {
+                            selectedFields.add(inlineSelection.name.value);
+                        } else if (inlineSelection.kind === Kind.FRAGMENT_SPREAD) {
+                            // Recursively expand fragment spreads within inline fragments
+                            this.expandFragmentFields(inlineSelection.name.value, selectedFields, visitedFragments, targetTypeName);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Recursively expand fragment spreads in a selection set.
+     * Returns a flattened array of selections with all fragment spreads expanded.
+     *
+     * @param selections - The selections to expand (may contain fragment spreads)
+     * @param visitedFragments - Set to track visited fragments (prevents infinite loops)
+     * @returns Flattened array with fragment spreads replaced by their selections
+     *
+     * @example
+     * ```typescript
+     * // Input: [Field(id), FragmentSpread(UserFields), Field(name)]
+     * // Output: [Field(id), Field(email), Field(avatar), Field(name)]
+     * // (assuming UserFields fragment contains email and avatar fields)
+     * ```
+     */
+    private expandSelectionSet(selections: readonly any[], visitedFragments: Set<string> = new Set()): any[] {
+        const expandedSelections: any[] = [];
+
+        for (const selection of selections) {
+            if (selection.kind === Kind.FRAGMENT_SPREAD) {
+                // Prevent infinite loops from circular fragment references
+                if (visitedFragments.has(selection.name.value)) {
+                    continue;
+                }
+
+                visitedFragments.add(selection.name.value);
+
+                const fragment = this._allFragments.get(selection.name.value);
+                if (fragment?.node?.selectionSet) {
+                    // Recursively expand the fragment's selections
+                    const fragmentSelections = this.expandSelectionSet(fragment.node.selectionSet.selections, visitedFragments);
+                    expandedSelections.push(...fragmentSelections);
+                }
+            } else {
+                // Keep field selections and inline fragments as-is
+                expandedSelections.push(selection);
+            }
+        }
+
+        return expandedSelections;
+    }
+
+    /**
+     * Collect type selections iteratively using breadth-first traversal.
+     *
+     * This method processes the GraphQL selection set level by level to build a complete
+     * map of all types and their selected fields. It uses an iterative approach with a queue
+     * to avoid stack overflow on deeply nested queries.
+     *
+     * @param initialSelections - The selections to start processing
+     * @param typeSelections - Map to accumulate type selections (mutated in place)
+     * @param initialParentType - The GraphQL type these selections belong to
+     * @param initialContextPath - The dot-separated path from operation root
+     */
+    private collectTypeSelectionsIteratively(
+        initialSelections: readonly any[],
+        typeSelections: Map<string, TypeFieldSelection>,
+        initialParentType: any,
+        initialContextPath = ''
+    ) {
+        let processingQueue: SelectionQueueItem[] = [
+            {
+                selections: initialSelections,
+                parentType: initialParentType,
+                contextPath: initialContextPath
+            }
+        ];
+
+        while (processingQueue.length > 0) {
+            processingQueue = processingQueue.flatMap((queueItem) => this.processSelectionQueueItem(queueItem, typeSelections));
+        }
+    }
+
+    /**
+     * Process a single queue item and return next level items.
+     */
+    private processSelectionQueueItem(
+        queueItem: SelectionQueueItem,
+        typeSelections: Map<string, TypeFieldSelection>
+    ): SelectionQueueItem[] {
+        const { selections, parentType, contextPath, interfaceFieldName } = queueItem;
+        const nextLevelItems: SelectionQueueItem[] = [];
+
+        for (const selection of selections) {
+            const items = this.processSelection(selection, parentType, contextPath, interfaceFieldName, typeSelections);
+            nextLevelItems.push(...items);
+        }
+
+        return nextLevelItems;
+    }
+
+    /**
+     * Process a single selection and dispatch to the appropriate handler.
+     */
+    private processSelection(
+        selection: any,
+        parentType: any,
+        contextPath: string,
+        interfaceFieldName: string | undefined,
+        typeSelections: Map<string, TypeFieldSelection>
+    ): SelectionQueueItem[] {
+        switch (selection.kind) {
+            case Kind.FIELD:
+                return this.handleFieldSelection(selection, parentType, contextPath, interfaceFieldName, typeSelections);
+            case Kind.FRAGMENT_SPREAD:
+                return this.handleFragmentSpread(selection, parentType, contextPath);
+            case Kind.INLINE_FRAGMENT:
+                return this.handleInlineFragment(selection, parentType, contextPath);
+            default:
+                return [];
+        }
+    }
+
+    /**
+     * Handle a field selection, dispatching to interface/object/union handlers as needed.
+     */
+    private handleFieldSelection(
+        selection: any,
+        parentType: any,
+        contextPath: string,
+        interfaceFieldName: string | undefined,
+        typeSelections: Map<string, TypeFieldSelection>
+    ): SelectionQueueItem[] {
+        if (!isObjectType(parentType)) return [];
+
+        const fieldName = selection.name.value;
+        const fieldDef = parentType.getFields()[fieldName];
+        if (!fieldDef) return [];
+
+        const fieldType = getNamedType(fieldDef.type);
+        const newContextPath = contextPath ? `${contextPath}.${fieldName}` : fieldName;
+
+        if (isInterfaceType(fieldType)) {
+            return this.handleInterfaceFieldSelection(selection, fieldName, newContextPath, typeSelections);
+        } else if (isObjectType(fieldType)) {
+            return this.handleObjectFieldSelection(selection, fieldType, newContextPath, interfaceFieldName, typeSelections);
+        } else if (isUnionType(fieldType)) {
+            return this.handleUnionFieldSelection(selection, fieldType, fieldName, newContextPath, typeSelections);
+        }
+
+        return [];
+    }
+
+    /**
+     * Handle interface type field selections.
+     * Creates separate type selections for each concrete implementing type.
+     */
+    private handleInterfaceFieldSelection(
+        selection: any,
+        fieldName: string,
+        newContextPath: string,
+        typeSelections: Map<string, TypeFieldSelection>
+    ): SelectionQueueItem[] {
+        if (!selection.selectionSet) return [];
+
+        const nextLevelItems: SelectionQueueItem[] = [];
+
+        // Collect all selections including those from fragment spreads
+        const allInterfaceSelections = this.expandFragmentSpreadsInSelections(selection.selectionSet.selections);
+
+        // Get concrete implementing types from inline fragments
+        const inlineFragments = allInterfaceSelections.filter((sel) => sel.kind === Kind.INLINE_FRAGMENT && sel.typeCondition);
+
+        // Collect common fields (those outside inline fragments)
+        const { commonFields, commonFieldSelections } = this.collectCommonFields(allInterfaceSelections);
+
+        // Expand common field selections for traversal
+        const expandedCommonSelections = this.expandSelectionSet(commonFieldSelections);
+
+        // Create a type selection for each concrete type from inline fragments
+        inlineFragments.forEach((inlineFragment, index) => {
+            const concreteTypeName = inlineFragment.typeCondition.name.value;
+            const concreteType = this._schema.getType(concreteTypeName);
+            const interfaceContextPath = `${newContextPath}.${concreteTypeName}`;
+
+            let typeSelection = typeSelections.get(interfaceContextPath);
+            if (!typeSelection) {
+                typeSelection = {
+                    typeName: concreteTypeName,
+                    contextPath: interfaceContextPath,
+                    selectedFields: new Set(commonFields),
+                    concreteTypeName,
+                    inlineFragmentOrder: index
+                };
+                typeSelections.set(interfaceContextPath, typeSelection);
+            }
+
+            // Add fields specific to this concrete type
+            if (inlineFragment.selectionSet) {
+                this.addFieldsFromSelectionSet(inlineFragment.selectionSet.selections, typeSelection.selectedFields, concreteTypeName);
+
+                const expandedInterfaceSelections = this.expandSelectionSet(inlineFragment.selectionSet.selections);
+
+                nextLevelItems.push({
+                    selections: [...expandedCommonSelections, ...expandedInterfaceSelections],
+                    parentType: concreteType,
+                    contextPath: interfaceContextPath,
+                    interfaceFieldName: fieldName
+                });
+            }
+        });
+
+        return nextLevelItems;
+    }
+
+    /**
+     * Handle object type field selections.
+     */
+    private handleObjectFieldSelection(
+        selection: any,
+        fieldType: any,
+        newContextPath: string,
+        interfaceFieldName: string | undefined,
+        typeSelections: Map<string, TypeFieldSelection>
+    ): SelectionQueueItem[] {
+        let typeSelection = typeSelections.get(newContextPath);
+        if (!typeSelection) {
+            typeSelection = {
+                typeName: fieldType.name,
+                contextPath: newContextPath,
+                selectedFields: new Set(),
+                interfaceFieldName
+            };
+            typeSelections.set(newContextPath, typeSelection);
+        }
+
+        if (!selection.selectionSet) return [];
+
+        for (const subSelection of selection.selectionSet.selections) {
+            if (subSelection.kind === Kind.FIELD) {
+                typeSelection.selectedFields.add(subSelection.name.value);
+            } else if (subSelection.kind === Kind.FRAGMENT_SPREAD) {
+                this.expandFragmentFields(subSelection.name.value, typeSelection.selectedFields, new Set(), fieldType.name);
+            } else if (subSelection.kind === Kind.INLINE_FRAGMENT) {
+                this.handleInlineFragmentForObjectType(subSelection, fieldType.name, typeSelection.selectedFields);
+            }
+        }
+
+        const expandedSelections = this.expandSelectionSet(selection.selectionSet.selections);
+
+        return [
+            {
+                selections: expandedSelections,
+                parentType: fieldType,
+                contextPath: newContextPath
+            }
+        ];
+    }
+
+    /**
+     * Handle inline fragments within object type field selections.
+     */
+    private handleInlineFragmentForObjectType(subSelection: any, fieldTypeName: string, selectedFields: Set<string>): void {
+        const inlineFragmentTypeName = subSelection.typeCondition?.name.value;
+
+        // If no type condition, it applies to the current type
+        // If there is a type condition, check if it matches the current type
+        if (!inlineFragmentTypeName || inlineFragmentTypeName === fieldTypeName) {
+            if (subSelection.selectionSet) {
+                this.addFieldsFromSelectionSet(subSelection.selectionSet.selections, selectedFields, fieldTypeName);
+            }
+        }
+    }
+
+    /**
+     * Handle union type field selections.
+     * Creates separate type selections for each union member type.
+     */
+    private handleUnionFieldSelection(
+        selection: any,
+        fieldType: any,
+        fieldName: string,
+        newContextPath: string,
+        typeSelections: Map<string, TypeFieldSelection>
+    ): SelectionQueueItem[] {
+        if (!selection.selectionSet) return [];
+
+        const nextLevelItems: SelectionQueueItem[] = [];
+        const unionTypes = fieldType.getTypes();
+
+        // Collect all selections including those from fragment spreads
+        const allUnionSelections = this.expandFragmentSpreadsInSelections(selection.selectionSet.selections);
+
+        // Process inline fragments for each union member type
+        for (const unionMemberType of unionTypes) {
+            const unionMemberContextPath = `${newContextPath}.${unionMemberType.name}`;
+
+            for (const subSelection of allUnionSelections) {
+                if (subSelection.kind === Kind.INLINE_FRAGMENT && subSelection.typeCondition?.name.value === unionMemberType.name) {
+                    let typeSelection = typeSelections.get(unionMemberContextPath);
+                    if (!typeSelection) {
+                        typeSelection = {
+                            typeName: unionMemberType.name,
+                            contextPath: unionMemberContextPath,
+                            selectedFields: new Set(),
+                            interfaceFieldName: fieldName
+                        };
+                        typeSelections.set(unionMemberContextPath, typeSelection);
+                    }
+
+                    this.addFieldsFromSelectionSet(
+                        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+                        subSelection.selectionSet!.selections,
+                        typeSelection.selectedFields,
+                        unionMemberType.name
+                    );
+
+                    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+                    const expandedUnionSelections = this.expandSelectionSet(subSelection.selectionSet!.selections);
+
+                    nextLevelItems.push({
+                        selections: expandedUnionSelections,
+                        parentType: unionMemberType,
+                        contextPath: unionMemberContextPath,
+                        interfaceFieldName: fieldName
+                    });
+                }
+            }
+        }
+
+        return nextLevelItems;
+    }
+
+    /**
+     * Handle fragment spread at the top level of selection processing.
+     */
+    private handleFragmentSpread(selection: any, parentType: any, contextPath: string): SelectionQueueItem[] {
+        const fragment = this._allFragments.get(selection.name.value);
+        if (!fragment?.node?.selectionSet) return [];
+
+        const fragmentTypeName = fragment.onType;
+        const fragmentType = this._schema.getType(fragmentTypeName);
+
+        return [
+            {
+                selections: fragment.node.selectionSet.selections,
+                parentType: fragmentType || parentType,
+                contextPath
+            }
+        ];
+    }
+
+    /**
+     * Handle inline fragment at the top level of selection processing.
+     */
+    private handleInlineFragment(selection: any, parentType: any, contextPath: string): SelectionQueueItem[] {
+        if (!selection.selectionSet) return [];
+
+        const inlineFragmentType = selection.typeCondition ? this._schema.getType(selection.typeCondition.name.value) : parentType;
+
+        return [
+            {
+                selections: selection.selectionSet.selections,
+                parentType: inlineFragmentType || parentType,
+                contextPath
+            }
+        ];
+    }
+
+    /**
+     * Expand fragment spreads in a list of selections, returning all selections with fragments inlined.
+     */
+    private expandFragmentSpreadsInSelections(selections: readonly any[]): any[] {
+        const result: any[] = [];
+
+        for (const subSelection of selections) {
+            if (subSelection.kind === Kind.FRAGMENT_SPREAD) {
+                const fragment = this._allFragments.get(subSelection.name.value);
+                if (fragment?.node?.selectionSet) {
+                    result.push(...fragment.node.selectionSet.selections);
+                }
+            } else {
+                result.push(subSelection);
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Collect common fields (fields outside inline fragments) from a selection set.
+     */
+    private collectCommonFields(allSelections: any[]): { commonFields: Set<string>; commonFieldSelections: any[] } {
+        const commonFields = new Set<string>();
+        const commonFieldSelections: any[] = [];
+
+        for (const subSelection of allSelections) {
+            if (subSelection.kind === Kind.FIELD) {
+                commonFields.add(subSelection.name.value);
+                commonFieldSelections.push(subSelection);
+            } else if (subSelection.kind === Kind.FRAGMENT_SPREAD) {
+                this.expandFragmentFields(subSelection.name.value, commonFields, new Set(), undefined);
+            }
+        }
+
+        return { commonFields, commonFieldSelections };
+    }
+
+    /**
+     * Add fields from a selection set to a Set, expanding fragment spreads.
+     */
+    private addFieldsFromSelectionSet(selections: readonly any[], selectedFields: Set<string>, targetTypeName: string): void {
+        for (const sel of selections) {
+            if (sel.kind === Kind.FIELD) {
+                selectedFields.add(sel.name.value);
+            } else if (sel.kind === Kind.FRAGMENT_SPREAD) {
+                this.expandFragmentFields(sel.name.value, selectedFields, new Set(), targetTypeName);
+            }
+        }
+    }
+
+    /**
+     * Build a typescript-operations compatible type name based on operation context.
+     *
+     * Mimics the naming logic from SelectionSetToObject.buildParentFieldName and buildFragmentTypeName
+     * in @graphql-codegen/visitor-plugin-common.
+     *
+     * For operation types (Query/Mutation/Subscription), we skip adding the type name in the parent field.
+     *
+     * Pattern: ${operationName}${operationType}_${fieldPath}_${typeName}
+     *
+     * @param operation - The GraphQL operation definition
+     * @param operationName - Converted operation name
+     * @param operationType - Type of operation ('query', 'mutation', 'subscription')
+     * @param contextPath - Dot-separated path to this type (e.g., 'messages.author')
+     * @param terminalTypeName - The final GraphQL type name
+     * @returns TypeScript-operations style type name
+     *
+     * @example
+     * ```typescript
+     * // Operation "Messages" + Query + "messages" field + "Message" type
+     * buildTypeScriptOperationsTypeName(...)
+     * // Returns: "MessagesQuery_messages_Message"
+     *
+     * // Operation "Messages" + Query + "messages.author" path + "Author" type
+     * buildTypeScriptOperationsTypeName(...)
+     * // Returns: "MessagesQuery_messages_Message_author_Author"
+     *
+     * // For union types: "messages.result.SuccessResult"
+     * buildTypeScriptOperationsTypeName(...)
+     * // Returns: "MessagesQuery_messages_Message_result_SuccessResult"
+     * ```
+     */
+    private buildTypeScriptOperationsTypeName(
+        operation: OperationDefinitionNode,
+        operationName: string,
+        operationType: string,
+        contextPath: string,
+        terminalTypeName: string
+    ): string {
+        // Start with operation name + operation type (e.g., "MessagesQuery")
+        const operationTypeSuffix = operationType.charAt(0).toUpperCase() + operationType.slice(1);
+        let result = `${operationName}${operationTypeSuffix}`;
+
+        // Process context path: traverse schema to get actual type names at each level
+        // Pattern: _fieldName_TypeName_nestedField_NestedType...
+        if (contextPath) {
+            const parts = contextPath.split('.');
+
+            // Get the root type for the operation
+            const rootType = this.getRootTypeForOperation(operation);
+
+            if (!rootType) {
+                // Fallback: just use the terminal type name
+                return `${result}_${contextPath.split('.').join('_')}_${terminalTypeName}`;
+            }
+
+            let currentType: any = rootType;
+
+            // Traverse the path to build the full type name
+            for (let i = 0; i < parts.length; i++) {
+                const fieldName = parts[i];
+
+                // Add field name
+                result += `_${fieldName}`;
+
+                // Get the field definition to determine its type
+                if (isObjectType(currentType)) {
+                    const fieldDef = currentType.getFields()[fieldName];
+                    if (fieldDef) {
+                        const fieldType = getNamedType(fieldDef.type);
+
+                        // Check if fieldType is valid
+                        if (!fieldType || !fieldType.name) {
+                            result += `_${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)}`;
+                            continue;
+                        }
+
+                        // For union types, we need to check if the next part is a union member type
+                        if (isUnionType(fieldType) && i + 1 < parts.length) {
+                            // The next part should be the union member type name
+                            const nextPart = parts[i + 1];
+                            const unionTypes = fieldType.getTypes();
+                            const unionMemberType = unionTypes.find((t) => t && t.name === nextPart);
+
+                            if (unionMemberType) {
+                                // Skip adding the union type name, go directly to the member type
+                                i++; // Skip the next part (union member type name)
+                                result += `_${nextPart}`;
+                                currentType = unionMemberType;
+                            } else {
+                                // Not a union member, add the field type name
+                                result += `_${fieldType.name}`;
+                                currentType = fieldType;
+                            }
+                        } else if (isInterfaceType(fieldType) && i + 1 < parts.length) {
+                            // For interface types, check if the next part is a concrete implementing type
+                            const nextPart = parts[i + 1];
+                            const implementingType = this._schema.getType(nextPart);
+
+                            if (implementingType && isObjectType(implementingType)) {
+                                // Skip adding the interface type name, go directly to the implementing type
+                                i++; // Skip the next part (implementing type name)
+                                result += `_${nextPart}`;
+                                currentType = implementingType;
+                            } else {
+                                // Not an implementing type, add the interface type name
+                                result += `_${fieldType.name}`;
+                                currentType = fieldType;
+                            }
+                        } else {
+                            // Add the type name for this field
+                            result += `_${fieldType.name}`;
+                            currentType = fieldType;
+                        }
+                    } else {
+                        // Field not found, use capitalized field name as fallback
+                        result += `_${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)}`;
+                    }
+                } else {
+                    // Not an object type, use capitalized field name as fallback
+                    result += `_${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)}`;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Generate type aliases that map clean names to typescript-operations names.
+     *
+     * This method creates type aliases that make it easier to reference the verbose type names
+     * generated by the typescript-operations plugin. It also handles deduplication of nested
+     * types across operations - if the same nested type with identical field selections appears
+     * in multiple operations, all aliases will reference the first occurrence.
+     *
+     * @returns Array of type alias declaration strings
+     *
+     * @example
+     * ```typescript
+     * // Input: Query Messages { messages { id, author { name } } }
+     * // Output:
+     * // export type Query_Messages = MessagesQuery_messages_Message;
+     * // export type Query_Messages_Author = MessagesQuery_messages_Message_author_Author;
+     *
+     * // With deduplication:
+     * // If Author.address appears in multiple queries with same fields,
+     * // all type aliases will reference the first occurrence:
+     * // export type Query_Messages_Author_Address = MessagesQuery_messages_Message_author_Author_address_Address;
+     * // export type Query_Posts_Author_Address = MessagesQuery_messages_Message_author_Author_address_Address; // same!
+     * ```
+     */
+    generateTypeAliases(): string[] {
+        const operations = this.extractOperations();
+
+        // Track the FIRST occurrence of each ParentTypeName.fieldName combination WITH identical field selections
+        // TypeScript-operations deduplicates nested types only when they have the same field selections
+        // Key: "ParentTypeName.fieldName:field1,field2,..." (e.g., "Author.address:street,city,zip")
+        // Value: { operation, operationName, operationType, contextPath, typeName }
+        const globalNestedTypeFirstOccurrence = new Map<
+            string,
+            {
+                operation: OperationDefinitionNode;
+                operationName: string;
+                operationType: string;
+                contextPath: string;
+                typeName: string;
+            }
+        >();
+
+        // First pass: collect all type selections and track first occurrences
+        const allOperationData: Array<{
+            operation: OperationDefinitionNode;
+            operationName: string;
+            operationType: string;
+            typeSelections: TypeFieldSelection[];
+            hasSingleRoot: boolean;
+            rootFieldName?: string;
+        }> = [];
+
+        for (const operation of operations) {
+            const operationName = this.convertName(operation, {
+                useTypesPrefix: false,
+                useTypesSuffix: false
+            });
+            const operationType = operation.operation;
+            const typeSelections = this.findTypeSelections(operation);
+            const { isSingle: hasSingleRoot, rootFieldName } = this.hasSingleRootField(operation);
+
+            allOperationData.push({
+                operation,
+                operationName,
+                operationType,
+                typeSelections,
+                hasSingleRoot,
+                rootFieldName
+            });
+
+            // Track first occurrence of each nested type across all operations
+            // Only deduplicate types with identical field selections
+            for (const selection of typeSelections) {
+                const pathParts = selection.contextPath.split('.');
+                if (pathParts.length >= 2) {
+                    const currentField = pathParts[pathParts.length - 1];
+                    const parentPath = pathParts.slice(0, -1).join('.');
+                    const parentSelection = typeSelections.find((s) => s.contextPath === parentPath);
+
+                    if (parentSelection) {
+                        // Include field selections in the key to ensure we only deduplicate identical types
+                        const sortedFields = Array.from(selection.selectedFields).sort().join(',');
+
+                        // For nested fields under interface/union variants, use the interface field name
+                        // to ensure all variants share the same deduplication key
+                        let deduplicationKey: string;
+                        if (selection.interfaceFieldName) {
+                            // This is a nested field under an interface/union variant
+                            // Use the interface field name instead of the concrete type name
+                            deduplicationKey = `${selection.interfaceFieldName}.${currentField}:${sortedFields}`;
+                        } else {
+                            // Regular nested type
+                            deduplicationKey = `${parentSelection.typeName}.${currentField}:${sortedFields}`;
+                        }
+
+                        if (!globalNestedTypeFirstOccurrence.has(deduplicationKey)) {
+                            globalNestedTypeFirstOccurrence.set(deduplicationKey, {
+                                operation,
+                                operationName,
+                                operationType,
+                                contextPath: selection.contextPath,
+                                typeName: selection.typeName
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Second pass: generate type aliases
+        return allOperationData.flatMap(({ operation, operationName, operationType, typeSelections, hasSingleRoot, rootFieldName }) => {
+            return typeSelections.map((typeSelection) => {
+                const adjustedContextPath = this.adjustContextPath(typeSelection.contextPath, hasSingleRoot, rootFieldName);
+
+                // Build clean name (current mock function pattern) - uses adjusted path
+                const basePrefix = operationType.charAt(0).toUpperCase() + operationType.slice(1);
+                const cleanName = `${basePrefix}_${operationName}${contextToPascalCase(adjustedContextPath)}`;
+
+                // Check if this is a nested type that typescript-operations deduplicates
+                // Only deduplicate if the same parent type + field combination WITH identical field selections was seen
+                const pathParts = typeSelection.contextPath.split('.');
+                if (pathParts.length >= 2) {
+                    const currentField = pathParts[pathParts.length - 1];
+                    const parentPath = pathParts.slice(0, -1).join('.');
+                    const parentSelection = typeSelections.find((s) => s.contextPath === parentPath);
+
+                    if (parentSelection) {
+                        // Include field selections in the key to match first pass logic
+                        const sortedFields = Array.from(typeSelection.selectedFields).sort().join(',');
+
+                        // Use same deduplication key logic as first pass
+                        let deduplicationKey: string;
+                        if (typeSelection.interfaceFieldName) {
+                            // This is a nested field under an interface/union variant
+                            deduplicationKey = `${typeSelection.interfaceFieldName}.${currentField}:${sortedFields}`;
+                        } else {
+                            // Regular nested type
+                            deduplicationKey = `${parentSelection.typeName}.${currentField}:${sortedFields}`;
+                        }
+
+                        const canonicalOccurrence = globalNestedTypeFirstOccurrence.get(deduplicationKey);
+
+                        if (
+                            canonicalOccurrence &&
+                            (canonicalOccurrence.operation !== operation || canonicalOccurrence.contextPath !== typeSelection.contextPath)
+                        ) {
+                            // This nested type was seen in another operation (or earlier in this one) - use the canonical occurrence
+                            const tsOperationsName = this.buildTypeScriptOperationsTypeName(
+                                canonicalOccurrence.operation,
+                                canonicalOccurrence.operationName,
+                                canonicalOccurrence.operationType,
+                                canonicalOccurrence.contextPath,
+                                canonicalOccurrence.typeName
+                            );
+
+                            return `export type ${cleanName} = ${tsOperationsName};`;
+                        }
+                    }
+                }
+
+                // Not a deduplicated nested type - build the typescript-operations name directly
+                const tsOperationsName = this.buildTypeScriptOperationsTypeName(
+                    operation,
+                    operationName,
+                    operationType,
+                    typeSelection.contextPath,
+                    typeSelection.typeName
+                );
+
+                // Generate type alias
+                return `export type ${cleanName} = ${tsOperationsName};`;
+            });
+        });
+    }
 }
+
+/**
+ * GraphQL Code Generator plugin that generates mock functions and type aliases for operations.
+ *
+ * This plugin analyzes GraphQL operations and generates TypeScript code to help with testing.
+ * It has two modes controlled by the `generateTypeAliasesOnly` configuration option:
+ *
+ * **Mock Functions Mode** (default):
+ * Generates factory functions that create mock data matching your GraphQL operations.
+ * Each function returns properly typed mock objects with sensible defaults.
+ *
+ * **Type Aliases Mode**:
+ * Generates clean type aliases that map to the verbose names from typescript-operations plugin.
+ * Makes it easier to reference types like `Query_Messages` instead of `MessagesQuery_messages_Message`.
+ *
+ * @param schema - The GraphQL schema
+ * @param documents - GraphQL documents containing operations and fragments
+ * @param config - Plugin configuration options
+ * @param info - Additional context (e.g., output file path)
+ * @returns Generated TypeScript code as a string
+ *
+ * @example
+ * ```typescript
+ * // graphql.config.ts
+ * {
+ *   generates: {
+ *     'src/graphql/generated/': {
+ *       preset: 'near-operation-file',
+ *       plugins: [
+ *         'typescript-operations',
+ *         'mock-operations-plugin'
+ *       ],
+ *       config: {
+ *         typePrefix: 'QueryTypes.',
+ *         scalars: {
+ *           LocalDate: 'new Date()',
+ *           TimezoneDate: 'new Date()'
+ *         }
+ *       }
+ *     }
+ *   }
+ * }
+ * ```
+ *
+ * @example
+ * ```typescript
+ * // Usage in tests:
+ * import { fake_Messages, fake_Messages_author } from './messages.mocks';
+ *
+ * const mockMessages = fake_Messages();
+ * // Returns array of 2 Message objects with all fields filled
+ *
+ * const customMessage = fake_Messages_author('', { name: 'Custom Author' });
+ * // Returns Author object with name overridden
+ * ```
+ */
+export const plugin: PluginFunction<OperationMocksPluginConfig> = (
+    schema: GraphQLSchema,
+    documents: Types.DocumentFile[],
+    config: OperationMocksPluginConfig,
+    info?: any
+): string => {
+    // Check if documents contain any operations (not just fragments)
+    const hasOperations = documents.some((doc) =>
+        doc.document?.definitions.some((def) => def.kind === Kind.OPERATION_DEFINITION && def.name?.value)
+    );
+
+    // Skip generation if there are no operations (only fragments)
+    if (!hasOperations) {
+        return '';
+    }
+
+    // Extract fragments from documents AND from config.externalFragments (near-operation-file preset)
+    const allFragments: LoadedFragment[] = [
+        // Fragments from current documents
+        ...documents
+            .flatMap((doc) => doc.document?.definitions || [])
+            .filter((def): def is FragmentDefinitionNode => def.kind === Kind.FRAGMENT_DEFINITION)
+            .map((fragmentDef) => ({
+                name: fragmentDef.name.value,
+                onType: fragmentDef.typeCondition.name.value,
+                node: fragmentDef,
+                isExternal: false,
+                importFrom: null
+            })),
+        // External fragments from preset (near-operation-file)
+        ...(config.externalFragments || [])
+    ];
+
+    const visitor = new OperationMocksVisitor(schema, allFragments, config, documents);
+
+    try {
+        // Check if we should generate type aliases instead of mock functions
+        if (config.generateTypeAliasesOnly) {
+            // Generate type aliases only
+            const typeAliases = visitor.generateTypeAliases();
+
+            // Add debug comment
+            const debug = `// Debug: Generated ${typeAliases.length} type aliases`;
+
+            return [debug, ...typeAliases].join('\n\n');
+        }
+
+        // Generate mock functions (default behavior)
+        const mockFunctions = visitor.generateMockFunctions();
+
+        // Generate import statement based on output file path
+        let importStatement = ``;
+
+        if (info?.outputFile) {
+            // Extract filename without extension from the output file path
+            const outputPath = info.outputFile;
+            const pathParts = outputPath.split('/');
+            const filename = pathParts[pathParts.length - 1];
+            const filenameWithoutExtension = filename.split('.').slice(0, -1).join('.').replace('.mocks', '');
+
+            // Generate the import path
+            importStatement = `import type * as QueryTypes from './${filenameWithoutExtension}.types';`;
+        }
+
+        return [importStatement, '', ...mockFunctions].join('\n\n');
+    } catch (error) {
+        throw new Error(`GraphQL Mock Operations Plugin failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+};
